@@ -8,6 +8,11 @@ This repository follows the standard Isaac Lab project structure, and is tested 
 
 ## Installation
 
+- Activate the Isaac Lab conda environment before installing dependencies or running any project scripts:
+    ```bash
+    conda activate env_isaaclab
+    ```
+
 - Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
   We recommend using the conda installation as it simplifies calling Python scripts from the terminal.
 
@@ -23,12 +28,21 @@ This repository follows the standard Isaac Lab project structure, and is tested 
 - Using a python interpreter that has Isaac Lab installed, install the library in editable mode using:
 
     ```bash
+    conda activate env_isaaclab
     # use 'PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
     python -m pip install -e source/booster_train
     ```
 
+- Install the exported Python requirements for this repository if you are setting up the environment from scratch:
+
+    ```bash
+    conda activate env_isaaclab
+    python -m pip install -r requirements.txt
+    ```
+
 - Prepare BeyondMimic motion data:
     ```bash
+    conda activate env_isaaclab
     # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
     python scripts/csv_to_npz.py --headless --input_file=<PATH_TO_BOOSTER_ASSETS>/motions/K1/<MOTION>.csv --input_fps=<FPS> --output_name=<PATH_TO_BOOSTER_ASSETS>/motions/K1/<MOTION>.npz
     ```
@@ -38,13 +52,30 @@ This repository follows the standard Isaac Lab project structure, and is tested 
 - Listing the available tasks:
 
     ```bash
+    conda activate env_isaaclab
     # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
     python scripts/list_envs.py
+    ```
+
+- Finding the correct task name for training or play:
+
+    Use the task listing above to inspect the exact registered environment IDs before launching a run. In general, training tasks end with `-v0` and the corresponding play tasks end with `-v0-Play`.
+
+    For example:
+    - `Booster-K1-Fight_001-v0` for training
+    - `Booster-K1-Fight_001-v0-Play` for playback/export
+
+    You can also search the task registration files directly:
+
+    ```bash
+    conda activate env_isaaclab
+    rg 'id="Booster-' source/booster_train/booster_train/tasks
     ```
 
 - Running a task:
 
     ```bash
+    conda activate env_isaaclab
     # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
     python scripts/rsl_rl/train.py --task=<TASK_NAME> --headless --device cuda:N
     ```
@@ -52,6 +83,7 @@ This repository follows the standard Isaac Lab project structure, and is tested 
 - Play a trained policy and export it for deployment:
 
     ```bash
+    conda activate env_isaaclab
     # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
     python scripts/rsl_rl/play.py --task=<TASK_NAME> --checkpoint=<CHECKPOINT_PATH>
     ```
