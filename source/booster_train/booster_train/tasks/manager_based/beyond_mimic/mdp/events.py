@@ -54,7 +54,7 @@ def randomize_joint_default_pos(
 
 def randomize_rigid_body_com(
     env: ManagerBasedEnv,
-    env_ids: torch.Tensor | None,
+    env_ids: torchrandpe.Tensor | None,
     com_range: dict[str, tuple[float, float]],
     asset_cfg: SceneEntityCfg,
 ):

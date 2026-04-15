@@ -1,0 +1,60 @@
+#1
+If you kept the current reward terms and only wanted bilevel over the existing weights, the main pieces would be:
+
+fight_001/tracking_env_cfg.py (line 200): this is where the tunable variables live right now. The outer loop would modify entries like motion_foot_pos.weight, motion_trunk_ori.weight, 
+action_rate_l2.weight, etc.
+
+
+scripts/rsl_rl/train.py (line 108): this is effectively your current inner-loop entrypoint. The real inner loop is the PPO call at train.py (line 195), runner.learn(...). 
+For bilevel, you’d usually refactor this into a callable “train once with reward weights w” function, or wrap it from a new outer-loop script.
+
+fight_001/ppo_cfg.py (line 6) and agents/rsl_rl_ppo_cfg.py (line 6): you’d likely make a shorter/cheaper inner-loop training config here,
+ because bilevel means retraining many times.
+
+scripts/rsl_rl/play.py (line 88): this is the closest existing evaluation path. The outer loop needs a scorer that evaluates the trained policy and returns metrics for selection. 
+In practice I’d add a dedicated evaluator rather than use raw training reward alone.
+
+
+fight_001/env_cfg.py (line 11): if your outer objective includes robustness or transfer, this is where train/eval condition splits would likely be controlled.
+What you probably would not need to touch at first:
+
+mdp/rewards.py (line 1), unless you want new reward terms instead of just reweighting existing ones.
+fight_001/init.py (line 12), unless you want a separate bilevel-specific task registration.
+So the minimal architecture would be:
+
+Outer loop proposes reward weights.
+Inner loop calls the existing PPO trainer with those weights.
+
+Evaluator scores the trained policy on held-out metrics.
+Outer loop updates the weights and repeats.
+If you want, I can turn that into a repo-specific implementation plan with exact “new file / modify file / responsibility” bullets, still without changing anything.
+
+
+
+#2
+important: 
+
+setup, a reasonable first search set would be things like:
+
+motion_foot_pos
+motion_hand_pos
+motion_trunk_ori
+action_rate_l2
+undesired_contacts
+
+That gives you a clean tradeoff space:
+tracking fidelity
+style/body alignment
+smoothness/control effort
+contact discipline
+
+
+I would leave these fixed initially:
+joint_limit
+the broad base terms like motion_body_pos, motion_body_ori, motion_body_lin_vel, motion_body_ang_vel
+
+
+
+#3 
+
+OUTPUT REWARD CHANGES AS THE INNER LOOP AND OUTER LOOP FIGURE OUT WHAT REWARD WEIGHTS TO SELECT:
