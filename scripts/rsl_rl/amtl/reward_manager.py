@@ -62,8 +62,12 @@ class RewardManager(ManagerBase):
         # create buffer for managing reward per environment
         self._reward_buf = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
-        # Buffer which stores the current step reward for each term for each environment
+        # Buffers for per-term reward bookkeeping.
+        # `_step_reward` stores weighted per-term rewards before multiplying by `dt`.
+        # This keeps each reward objective separate for downstream AMTL-style losses.
+        self._step_reward_raw = torch.zeros((self.num_envs, len(self._term_names)), dtype=torch.float, device=self.device)
         self._step_reward = torch.zeros((self.num_envs, len(self._term_names)), dtype=torch.float, device=self.device)
+        self._step_reward_dt = torch.zeros((self.num_envs, len(self._term_names)), dtype=torch.float, device=self.device)
 
     def __str__(self) -> str:
         """Returns: A string representation for reward manager."""
@@ -93,6 +97,33 @@ class RewardManager(ManagerBase):
     def active_terms(self) -> list[str]:
         """Name of active reward terms."""
         return self._term_names
+
+    @property
+    def step_reward_raw(self) -> torch.Tensor:
+        """Raw per-term reward values for the current step.
+
+        Shape is ``(num_envs, num_terms)``. These values are produced directly by each reward
+        term function before applying the configured term weights.
+        """
+        return self._step_reward_raw
+
+    @property
+    def step_reward_weighted(self) -> torch.Tensor:
+        """Weighted per-term reward values for the current step.
+
+        Shape is ``(num_envs, num_terms)``. These values are the natural objective signals to use
+        if a downstream learner wants separate losses or gradients per reward term.
+        """
+        return self._step_reward
+
+    @property
+    def step_reward_weighted_dt(self) -> torch.Tensor:
+        """Weighted and time-scaled per-term reward values for the current step.
+
+        Shape is ``(num_envs, num_terms)``. Summing this tensor across terms reproduces the scalar
+        reward returned to the environment.
+        """
+        return self._step_reward_dt
 
     """
     Operations.
@@ -125,42 +156,44 @@ class RewardManager(ManagerBase):
             term_cfg.func.reset(env_ids=env_ids)
         # return logged information
         return extras
-
     def compute(self, dt: float) -> torch.Tensor:
         """Computes the reward signal as a weighted sum of individual terms.
 
-        This function calls each reward term managed by the class and adds them to compute the net
-        reward signal. It also updates the episodic sums corresponding to individual reward terms.
+        The reward manager keeps the per-term rewards separate in dedicated buffers while still
+        returning the standard scalar environment reward. This is the correct boundary for any
+        downstream implementation that wants to build separate losses, compute separate gradients,
+        align them, and only then combine updates.
 
         Args:
             dt: The time-step interval of the environment.
 
         Returns:
-            The net reward signal of shape (num_envs,).
+            The scalar reward signal of shape ``(num_envs,)``.
         """
-        # reset computation
         self._reward_buf[:] = 0.0
-        # iterate over all the reward terms
+
         for term_idx, (name, term_cfg) in enumerate(zip(self._term_names, self._term_cfgs)):
-            # skip if weight is zero (kind of a micro-optimization)
             if term_cfg.weight == 0.0:
+                self._step_reward_raw[:, term_idx] = 0.0
                 self._step_reward[:, term_idx] = 0.0
+                self._step_reward_dt[:, term_idx] = 0.0
                 continue
-            # compute term's value
-            value = term_cfg.func(self._env, **term_cfg.params) * term_cfg.weight * dt
-            # update total reward
-            self._reward_buf += value
-            # update episodic sum
-            self._episode_sums[name] += value
-            # Update current reward for this step.
-            self._step_reward[:, term_idx] = value / dt
-            
-           #print(self._term_names)
-           #print(self._step_reward[4095])
 
-          
-        return self._reward_buf #reward_buf is total reward????
+            raw_value = term_cfg.func(self._env, **term_cfg.params)
+            weighted_value = raw_value * term_cfg.weight
+            value_dt = weighted_value * dt
 
+            self._step_reward_raw[:, term_idx] = raw_value
+            self._step_reward[:, term_idx] = weighted_value
+            self._step_reward_dt[:, term_idx] = weighted_value * dt
+
+            self._reward_buf += value_dt
+            self._episode_sums[name] += value_dt
+
+        return self._reward_buf
+
+
+    
     """
     Operations - Term settings.
     """
@@ -200,7 +233,8 @@ class RewardManager(ManagerBase):
     def get_active_iterable_terms(self, env_idx: int) -> Sequence[tuple[str, Sequence[float]]]:
         """Returns the active terms as iterable sequence of tuples.
 
-        The first element of the tuple is the name of the term and the second element is the raw value(s) of the term.
+        The first element of the tuple is the name of the term and the second element is the
+        weighted value(s) of the term before multiplying by ``dt``.
 
         Args:
             env_idx: The specific environment to pull the active terms from.

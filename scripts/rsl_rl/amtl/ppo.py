@@ -8,6 +8,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from collections.abc import Sequence
 from itertools import chain
 from tensordict import TensorDict
 
@@ -41,6 +42,7 @@ class PPO:
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
         device: str = "cpu",
+        env=None,
         normalize_advantage_per_mini_batch: bool = False,
         # RND parameters
         rnd_cfg: dict | None = None,
@@ -51,6 +53,7 @@ class PPO:
     ) -> None:
         # Device-related parameters
         self.device = device
+        self.env = env
         self.is_multi_gpu = multi_gpu_cfg is not None
 
         # Multi-GPU parameters
@@ -124,6 +127,73 @@ class PPO:
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
+    def _get_reward_manager(self):
+        if self.env is None:
+            return None
+
+        for env_candidate in (self.env, getattr(self.env, "unwrapped", None)):
+            if env_candidate is None:
+                continue
+            reward_manager = getattr(env_candidate, "reward_manager", None)
+            if reward_manager is not None:
+                return reward_manager
+        return None
+
+    def _get_reward_terms(self) -> torch.Tensor | None:
+        reward_manager = self._get_reward_manager()
+        if reward_manager is None:
+            return None
+        if hasattr(reward_manager, "step_reward_weighted_dt"):
+            return reward_manager.step_reward_weighted_dt.detach().clone()
+        if hasattr(reward_manager, "step_reward_weighted"):
+            return reward_manager.step_reward_weighted.detach().clone()
+        return None
+
+    def _flatten_grad_list(
+        self, grads: Sequence[torch.Tensor | None], params: Sequence[torch.nn.Parameter]
+    ) -> torch.Tensor:
+        flat_grads = []
+        for grad, param in zip(grads, params):
+            if grad is None:
+                flat_grads.append(torch.zeros_like(param).reshape(-1))
+            else:
+                flat_grads.append(grad.reshape(-1))
+        return torch.cat(flat_grads)
+
+    def _set_flat_gradients(self, params: Sequence[torch.nn.Parameter], flat_grad: torch.Tensor) -> None:
+        offset = 0
+        for param in params:
+            numel = param.numel()
+            param_grad = flat_grad[offset : offset + numel].view_as(param)
+            if param.grad is None:
+                param.grad = param_grad.clone()
+            else:
+                param.grad.copy_(param_grad)
+            offset += numel
+
+    def _align_loss_gradients(
+        self, losses: Sequence[torch.Tensor], params: Sequence[torch.nn.Parameter]
+    ) -> torch.Tensor:
+        if len(losses) == 0:
+            return torch.zeros(sum(param.numel() for param in params), device=self.device)
+
+        task_grads = []
+        for loss in losses:
+            grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+            task_grads.append(self._flatten_grad_list(grads, params))
+
+        aligned_grads = [grad.clone() for grad in task_grads]
+        for task_index, grad in enumerate(aligned_grads):
+            for other_index, other_grad in enumerate(task_grads):
+                if task_index == other_index:
+                    continue
+                dot_product = torch.dot(grad, other_grad)
+                if dot_product < 0:
+                    grad_norm_sq = torch.dot(other_grad, other_grad).clamp_min(1.0e-12)
+                    grad -= dot_product / grad_norm_sq * other_grad
+
+        return torch.stack(aligned_grads, dim=0).mean(dim=0)
+
     def init_storage(
         self,
         training_type: str,
@@ -166,6 +236,7 @@ class PPO:
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
+        reward_terms = self._get_reward_terms()
         self.transition.dones = dones
 
         # Compute the intrinsic rewards and add to extrinsic rewards
@@ -174,12 +245,25 @@ class PPO:
             self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs)
             # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
+            intrinsic_reward_terms = self.intrinsic_rewards.unsqueeze(-1)
+            reward_terms = (
+                intrinsic_reward_terms
+                if reward_terms is None
+                else torch.cat((reward_terms, intrinsic_reward_terms), dim=-1)
+            )
 
         # Bootstrapping on time outs
         if "time_outs" in extras:
-            self.transition.rewards += self.gamma * torch.squeeze(
+            timeout_bonus = self.gamma * torch.squeeze(
                 self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
             )
+            self.transition.rewards += timeout_bonus
+            timeout_reward_terms = timeout_bonus.unsqueeze(-1)
+            reward_terms = (
+                timeout_reward_terms if reward_terms is None else torch.cat((reward_terms, timeout_reward_terms), dim=-1)
+            )
+
+        self.transition.reward_terms = reward_terms
 
         # Record the transition
         self.storage.add_transitions(self.transition)
@@ -220,6 +304,8 @@ class PPO:
             old_sigma_batch,
             hidden_states_batch,
             masks_batch,
+            advantages_by_term_batch,
+            returns_by_term_batch,
         ) in generator:
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
@@ -228,6 +314,10 @@ class PPO:
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
                     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+                    if advantages_by_term_batch is not None:
+                        term_mean = advantages_by_term_batch.mean(dim=0, keepdim=True)
+                        term_std = advantages_by_term_batch.std(dim=0, keepdim=True)
+                        advantages_by_term_batch = (advantages_by_term_batch - term_mean) / (term_std + 1e-8)
 
             # Perform symmetric augmentation
             if self.symmetry and self.symmetry["use_data_augmentation"]:
@@ -246,6 +336,10 @@ class PPO:
                 target_values_batch = target_values_batch.repeat(num_aug, 1)
                 advantages_batch = advantages_batch.repeat(num_aug, 1)
                 returns_batch = returns_batch.repeat(num_aug, 1)
+                if advantages_by_term_batch is not None:
+                    advantages_by_term_batch = advantages_by_term_batch.repeat(num_aug, 1)
+                if returns_by_term_batch is not None:
+                    returns_by_term_batch = returns_by_term_batch.repeat(num_aug, 1)
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with the new parameters
@@ -293,14 +387,22 @@ class PPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
-            # Surrogate loss
+            # Surrogate loss by term now that we have the option to do gradient surgery on each term separately
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
-
+            surrogate_losses_by_term = None
+            if advantages_by_term_batch is not None:
+                ratio_by_term = ratio.unsqueeze(-1)
+                clipped_ratio_by_term = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param).unsqueeze(-1)
+                surrogate_by_term = -advantages_by_term_batch * ratio_by_term
+                surrogate_clipped_by_term = -advantages_by_term_batch * clipped_ratio_by_term
+                surrogate_losses_by_term = torch.max(surrogate_by_term, surrogate_clipped_by_term).mean(dim=0)
+                surrogate_loss = surrogate_losses_by_term.mean()
+                print(surrogate_losses_by_term)
             # Value function loss
             if self.use_clipped_value_loss:
                 value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
@@ -312,7 +414,7 @@ class PPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            auxiliary_loss = self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             # Symmetry loss
             if self.symmetry:
@@ -343,7 +445,7 @@ class PPO:
                 )
                 # Add the loss to the total loss
                 if self.symmetry["use_mirror_loss"]:
-                    loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
+                    auxiliary_loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
                 else:
                     symmetry_loss = symmetry_loss.detach()
 
@@ -364,7 +466,15 @@ class PPO:
 
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
-            loss.backward()
+            if surrogate_losses_by_term is not None:
+                params = [param for param in self.policy.parameters() if param.requires_grad]
+                aligned_surrogate_grad = self._align_loss_gradients(list(surrogate_losses_by_term.unbind()), params)
+                auxiliary_grads = torch.autograd.grad(auxiliary_loss, params, allow_unused=True)
+                combined_grad = aligned_surrogate_grad + self._flatten_grad_list(auxiliary_grads, params)
+                self._set_flat_gradients(params, combined_grad)
+            else:
+                loss = surrogate_loss + auxiliary_loss
+                loss.backward()
             # Compute the gradients for RND
             if self.rnd:
                 self.rnd_optimizer.zero_grad()

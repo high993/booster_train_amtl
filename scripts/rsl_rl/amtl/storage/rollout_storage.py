@@ -20,6 +20,7 @@ class RolloutStorage:
             self.actions: torch.Tensor | None = None
             self.privileged_actions: torch.Tensor | None = None
             self.rewards: torch.Tensor | None = None
+            self.reward_terms: torch.Tensor | None = None
             self.dones: torch.Tensor | None = None
             self.values: torch.Tensor | None = None
             self.actions_log_prob: torch.Tensor
@@ -52,6 +53,7 @@ class RolloutStorage:
             device=self.device,
         )
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.reward_terms = None
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
@@ -67,6 +69,8 @@ class RolloutStorage:
             self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.returns_by_term = None
+            self.advantages_by_term = None
 
         # For RNN networks
         self.saved_hidden_state_a = None
@@ -74,6 +78,38 @@ class RolloutStorage:
 
         # Counter for the number of transitions stored
         self.step = 0
+
+    @property
+    def num_reward_terms(self) -> int:
+        if self.reward_terms is None:
+            return 0
+        return self.reward_terms.shape[-1]
+
+    def has_reward_terms(self) -> bool:
+        return self.reward_terms is not None
+
+    def _ensure_reward_term_buffers(self, reward_terms: torch.Tensor) -> None:
+        reward_terms = reward_terms.view(self.num_envs, -1)
+        num_reward_terms = reward_terms.shape[1]
+
+        if self.reward_terms is None:
+            self.reward_terms = torch.zeros(
+                self.num_transitions_per_env, num_envs := self.num_envs, num_reward_terms, device=self.device
+            )
+            if self.training_type == "rl":
+                self.returns_by_term = torch.zeros(
+                    self.num_transitions_per_env, num_envs, num_reward_terms, device=self.device
+                )
+                self.advantages_by_term = torch.zeros(
+                    self.num_transitions_per_env, num_envs, num_reward_terms, device=self.device
+                )
+            return
+
+        if reward_terms.shape[1] != self.num_reward_terms:
+            raise ValueError(
+                f"Inconsistent number of reward terms in rollout storage. "
+                f"Expected {self.num_reward_terms}, got {reward_terms.shape[1]}."
+            )
 
     def add_transitions(self, transition: Transition) -> None:
         # Check if the transition is valid
@@ -84,6 +120,9 @@ class RolloutStorage:
         self.observations[self.step].copy_(transition.observations)
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
+        if transition.reward_terms is not None:
+            self._ensure_reward_term_buffers(transition.reward_terms)
+            self.reward_terms[self.step].copy_(transition.reward_terms.view(self.num_envs, -1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
 
         # For distillation
@@ -150,6 +189,25 @@ class RolloutStorage:
         if normalize_advantage:
             self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
 
+
+        #adv by each individual term (no grouping)
+        if self.reward_terms is not None:
+            advantage_by_term = torch.zeros(self.num_envs, self.num_reward_terms, device=self.device)
+            for step in reversed(range(self.num_transitions_per_env)):
+                next_values = last_values if step == self.num_transitions_per_env - 1 else self.values[step + 1]
+                next_is_not_terminal = 1.0 - self.dones[step].float()
+                current_values = self.values[step].expand(-1, self.num_reward_terms)
+                next_values = next_values.expand(-1, self.num_reward_terms)
+                delta_by_term = self.reward_terms[step] + next_is_not_terminal * gamma * next_values - current_values
+                advantage_by_term = delta_by_term + next_is_not_terminal * gamma * lam * advantage_by_term
+                self.returns_by_term[step] = advantage_by_term + current_values
+
+            self.advantages_by_term = self.returns_by_term - self.values.expand(-1, -1, self.num_reward_terms)
+            if normalize_advantage:
+                mean = self.advantages_by_term.mean(dim=(0, 1), keepdim=True)
+                std = self.advantages_by_term.std(dim=(0, 1), keepdim=True)
+                self.advantages_by_term = (self.advantages_by_term - mean) / (std + 1e-8)
+
     # For distillation
     def generator(self) -> Generator:
         if self.training_type != "distillation":
@@ -177,6 +235,8 @@ class RolloutStorage:
         advantages = self.advantages.flatten(0, 1)
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
+        advantages_by_term = self.advantages_by_term.flatten(0, 1) if self.advantages_by_term is not None else None
+        returns_by_term = self.returns_by_term.flatten(0, 1) if self.returns_by_term is not None else None
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -194,6 +254,8 @@ class RolloutStorage:
                 advantages_batch = advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
+                advantages_by_term_batch = advantages_by_term[batch_idx] if advantages_by_term is not None else None
+                returns_by_term_batch = returns_by_term[batch_idx] if returns_by_term is not None else None
 
                 hidden_state_a_batch = None
                 hidden_state_c_batch = None
@@ -214,6 +276,8 @@ class RolloutStorage:
                         hidden_state_c_batch,
                     ),
                     masks_batch,
+                    advantages_by_term_batch,
+                    returns_by_term_batch,
                 )
 
     # For reinforcement learning with recurrent networks
@@ -245,6 +309,8 @@ class RolloutStorage:
                 advantages_batch = self.advantages[:, start:stop]
                 values_batch = self.values[:, start:stop]
                 old_actions_log_prob_batch = self.actions_log_prob[:, start:stop]
+                advantages_by_term_batch = self.advantages_by_term[:, start:stop] if self.advantages_by_term is not None else None
+                returns_by_term_batch = self.returns_by_term[:, start:stop] if self.returns_by_term is not None else None
 
                 # Reshape to [num_envs, time, num layers, hidden dim]
                 # Original shape: [time, num_layers, num_envs, hidden_dim])
@@ -286,6 +352,8 @@ class RolloutStorage:
                         hidden_state_c_batch,
                     ),
                     masks_batch,
+                    advantages_by_term_batch,
+                    returns_by_term_batch,
                 )
 
                 first_traj = last_traj
