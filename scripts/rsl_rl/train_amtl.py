@@ -9,6 +9,11 @@
 
 import argparse
 import sys
+from pathlib import Path
+
+AMTL_REPO_ROOT = Path(__file__).resolve().parents[2]
+AMTL_SOURCE_PATH = AMTL_REPO_ROOT / "source" / "booster_train"
+sys.path.insert(0, str(AMTL_SOURCE_PATH))
 
 from isaaclab.app import AppLauncher
 

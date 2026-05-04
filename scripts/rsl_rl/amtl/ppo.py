@@ -20,6 +20,97 @@ from amtl.utils import string_to_callable
 from amtl.actor_critic import ActorCritic
 
 
+
+
+
+
+
+def set_shared_grad(shared_params, grad_vec):
+    offset = 0
+    for p in shared_params:
+        _offset = offset + p.numel()
+        if p.grad is not None:
+            p.grad.data = grad_vec[offset:_offset].view_as(p.grad)
+        offset = _offset
+        # if p.grad is None:
+        #     continue
+        # _offset = offset + p.grad.shape.numel()
+        # p.grad.data = grad_vec[offset:_offset].view_as(p.grad)
+        # offset = _offset
+
+
+    
+
+
+class ProcrustesSolver:
+    @staticmethod
+    def apply(grads, scale_mode='min'):
+        assert (
+            len(grads.shape) == 3
+        ), f"Invalid shape of 'grads': {grads.shape}. Only 3D tensors are applicable"
+
+        with torch.no_grad():
+            cov_grad_matrix_e = torch.matmul(grads.permute(0, 2, 1), grads)
+            cov_grad_matrix_e = cov_grad_matrix_e.mean(0)
+
+            singulars, basis = torch.linalg.eigh(cov_grad_matrix_e)
+            tol = (
+                torch.max(singulars)
+                * max(cov_grad_matrix_e.shape[-2:])
+                * torch.finfo().eps
+            )
+            rank = sum(singulars > tol)
+
+            order = torch.argsort(singulars, dim=-1, descending=True)
+            singulars, basis = singulars[order][:rank], basis[:, order][:, :rank]
+
+            if scale_mode == 'min':
+                weights = basis * torch.sqrt(singulars[-1]).view(1, -1)
+            elif scale_mode == 'median':
+                weights = basis * torch.sqrt(torch.median(singulars)).view(1, -1)
+            elif scale_mode == 'rmse':
+                weights = basis * torch.sqrt(singulars.mean())
+
+            weights = weights / torch.sqrt(singulars).view(1, -1)
+            weights = torch.matmul(weights, basis.T)
+            grads = torch.matmul(grads, weights.unsqueeze(0))
+
+            return grads, weights, singulars
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
@@ -148,7 +239,7 @@ class PPO:
         if hasattr(reward_manager, "step_reward_weighted"):
             return reward_manager.step_reward_weighted.detach().clone()
         return None
-
+    '''
     def _flatten_grad_list(
         self, grads: Sequence[torch.Tensor | None], params: Sequence[torch.nn.Parameter]
     ) -> torch.Tensor:
@@ -193,6 +284,7 @@ class PPO:
                     grad -= dot_product / grad_norm_sq * other_grad
 
         return torch.stack(aligned_grads, dim=0).mean(dim=0)
+    '''
 
     def init_storage(
         self,
@@ -245,12 +337,6 @@ class PPO:
             self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs)
             # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
-            intrinsic_reward_terms = self.intrinsic_rewards.unsqueeze(-1)
-            reward_terms = (
-                intrinsic_reward_terms
-                if reward_terms is None
-                else torch.cat((reward_terms, intrinsic_reward_terms), dim=-1)
-            )
 
         # Bootstrapping on time outs
         if "time_outs" in extras:
@@ -258,10 +344,6 @@ class PPO:
                 self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
             )
             self.transition.rewards += timeout_bonus
-            timeout_reward_terms = timeout_bonus.unsqueeze(-1)
-            reward_terms = (
-                timeout_reward_terms if reward_terms is None else torch.cat((reward_terms, timeout_reward_terms), dim=-1)
-            )
 
         self.transition.reward_terms = reward_terms
 
@@ -387,6 +469,24 @@ class PPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
+
+
+
+            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+            surrogate = -torch.squeeze(advantages_batch) * ratio
+            surrogate_loss = surrogate.mean()
+            surrogate_losses_by_term = None
+
+            if advantages_by_term_batch is not None:
+                surrogate_by_term = -advantages_by_term_batch * ratio.unsqueeze(-1)
+                surrogate_losses_by_term = surrogate_by_term.mean(dim=0)
+                surrogate_loss = surrogate_losses_by_term.mean()
+
+            value_loss = (returns_batch - value_batch).pow(2).mean()
+            auxiliary_loss = self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+
+
+            '''
             # Surrogate loss by term now that we have the option to do gradient surgery on each term separately
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             surrogate = -torch.squeeze(advantages_batch) * ratio
@@ -395,6 +495,9 @@ class PPO:
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
             surrogate_losses_by_term = None
+        
+            
+            #for ppo
             if advantages_by_term_batch is not None:
                 ratio_by_term = ratio.unsqueeze(-1)
                 clipped_ratio_by_term = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param).unsqueeze(-1)
@@ -402,19 +505,22 @@ class PPO:
                 surrogate_clipped_by_term = -advantages_by_term_batch * clipped_ratio_by_term
                 surrogate_losses_by_term = torch.max(surrogate_by_term, surrogate_clipped_by_term).mean(dim=0)
                 surrogate_loss = surrogate_losses_by_term.mean()
-                print(surrogate_losses_by_term)
-            # Value function loss
-            if self.use_clipped_value_loss:
-                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
-                    -self.clip_param, self.clip_param
-                )
-                value_losses = (value_batch - returns_batch).pow(2)
-                value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            else:
-                value_loss = (returns_batch - value_batch).pow(2).mean()
+                #print("advantages_by_term_batch:", advantages_by_term_batch.shape)
+           '''
 
-            auxiliary_loss = self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+
+            # Value function loss
+            # if self.use_clipped_value_loss:
+            #     value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+            #         -self.clip_param, self.clip_param
+            #     )
+            #     value_losses = (value_batch - returns_batch).pow(2)
+            #     value_losses_clipped = (value_clipped - returns_batch).pow(2)
+            #     value_loss = torch.max(value_losses, value_losses_clipped).mean()
+            # else:
+            #     value_loss = (returns_batch - value_batch).pow(2).mean()
+
+            # auxiliary_loss = self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             # Symmetry loss
             if self.symmetry:
@@ -466,6 +572,69 @@ class PPO:
 
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
+
+
+
+
+
+
+
+            if surrogate_losses_by_term is not None:
+                grads = []
+                for loss in surrogate_losses_by_term:
+                    for p in self.policy.parameters():
+                        if p.grad is not None:
+                            p.grad.data.zero_()
+                    loss.backward(retain_graph=True)
+                    grad = torch.cat([p.grad.flatten().clone() if p.grad is not None else torch.zeros_like(p).flatten() for p in self.policy.parameters()])
+                    grads.append(grad)
+
+                for p in self.policy.parameters():
+                    if p.grad is not None:
+                        p.grad.data.zero_()
+
+                grads = torch.stack(grads, dim=0)
+                grads, weights, singulars = ProcrustesSolver.apply(grads.T.unsqueeze(0))
+                grad, weights = grads[0].sum(-1), weights.sum(-1)
+                set_shared_grad(self.policy.parameters(), grad)
+                auxiliary_loss.backward()
+            else:
+                (surrogate_loss + auxiliary_loss).backward()
+
+            # self.optimizer.step()
+
+            # grads = []
+            # for loss in surrogate_losses_by_term:
+            #     for p in self.policy.parameters():
+            #         if p.grad is not None:
+            #             p.grad.data.zero_()
+            #     loss.backward(retain_graph=True)
+            #     grad = torch.cat([p.grad.flatten().clone() if p.grad is not None else torch.zeros_like(p).flatten() for p in self.policy.parameters()])
+            #     grads.append(grad)
+            #
+            # for p in self.policy.parameters():
+            #     if p.grad is not None:
+            #         p.grad.data.zero_()
+            #
+            # grads = torch.stack(grads, dim=0)
+            # grads, weights, singulars = ProcrustesSolver.apply(grads.T.unsqueeze(0))
+            # grad, weights = grads[0].sum(-1), weights.sum(-1)
+            # set_shared_grad(self.policy.parameters(), grad)
+            #
+            # self.optimizer.step()
+
+
+
+
+
+
+
+
+
+
+
+
+            '''
             if surrogate_losses_by_term is not None:
                 params = [param for param in self.policy.parameters() if param.requires_grad]
                 aligned_surrogate_grad = self._align_loss_gradients(list(surrogate_losses_by_term.unbind()), params)
@@ -475,6 +644,8 @@ class PPO:
             else:
                 loss = surrogate_loss + auxiliary_loss
                 loss.backward()
+            '''
+
             # Compute the gradients for RND
             if self.rnd:
                 self.rnd_optimizer.zero_grad()
@@ -484,9 +655,27 @@ class PPO:
             if self.is_multi_gpu:
                 self.reduce_parameters()
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+          #  nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
+           # self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
