@@ -38,6 +38,7 @@ class RolloutStorage:
         num_transitions_per_env: int,
         obs: TensorDict,
         actions_shape: tuple[int] | list[int],
+        value_shape: tuple[int] | list[int] = (1,),
         device: str = "cpu",
     ) -> None:
         self.training_type = training_type
@@ -45,6 +46,7 @@ class RolloutStorage:
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
         self.actions_shape = actions_shape
+        self.value_shape = tuple(value_shape)
 
         # Core
         self.observations = TensorDict(
@@ -63,12 +65,12 @@ class RolloutStorage:
 
         # For reinforcement learning
         if training_type == "rl":
-            self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.values = torch.zeros(num_transitions_per_env, num_envs, *self.value_shape, device=self.device)
             self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
-            self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
-            self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.returns = torch.zeros(num_transitions_per_env, num_envs, *self.value_shape, device=self.device)
+            self.advantages = torch.zeros(num_transitions_per_env, num_envs, *self.value_shape, device=self.device)
             self.returns_by_term = None
             self.advantages_by_term = None
 
@@ -169,6 +171,20 @@ class RolloutStorage:
     def compute_returns(
         self, last_values: torch.Tensor, gamma: float, lam: float, normalize_advantage: bool = True
     ) -> None:
+        if self.reward_terms is not None and self.values.shape[-1] == self.num_reward_terms:
+            advantage_by_term = torch.zeros(self.num_envs, self.num_reward_terms, device=self.device)
+            for step in reversed(range(self.num_transitions_per_env)):
+                next_values = last_values if step == self.num_transitions_per_env - 1 else self.values[step + 1]
+                next_is_not_terminal = 1.0 - self.dones[step].float()
+                delta_by_term = self.reward_terms[step] + next_is_not_terminal * gamma * next_values - self.values[step]
+                advantage_by_term = delta_by_term + next_is_not_terminal * gamma * lam * advantage_by_term
+                self.returns_by_term[step] = advantage_by_term + self.values[step]
+
+            self.advantages_by_term = self.returns_by_term - self.values
+            self.returns = self.returns_by_term.clone()
+            self.advantages = self.advantages_by_term.clone()
+            return
+
         advantage = 0
         for step in reversed(range(self.num_transitions_per_env)):
             # If we are at the last step, bootstrap the return value

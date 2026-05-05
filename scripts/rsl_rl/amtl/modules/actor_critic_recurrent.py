@@ -23,6 +23,7 @@ class ActorCriticRecurrent(nn.Module):
         obs: TensorDict,
         obs_groups: dict[str, list[str]],
         num_actions: int,
+        critic_num_outputs: int = 1,
         actor_obs_normalization: bool = False,
         critic_obs_normalization: bool = False,
         actor_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
@@ -81,7 +82,8 @@ class ActorCriticRecurrent(nn.Module):
 
         # Critic
         self.memory_c = Memory(num_critic_obs, rnn_hidden_dim, rnn_num_layers, rnn_type)
-        self.critic = MLP(rnn_hidden_dim, 1, critic_hidden_dims, activation)
+        self.critic_num_outputs = critic_num_outputs
+        self.critic = MLP(rnn_hidden_dim, critic_num_outputs, critic_hidden_dims, activation)
         print(f"Critic RNN: {self.memory_c}")
         print(f"Critic MLP: {self.critic}")
 

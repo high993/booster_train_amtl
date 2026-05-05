@@ -22,6 +22,7 @@ class ActorCritic(nn.Module):
         obs: TensorDict,
         obs_groups: dict[str, list[str]],
         num_actions: int,
+        critic_num_outputs: int = 1,
         actor_obs_normalization: bool = False,
         critic_obs_normalization: bool = False,
         actor_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
@@ -66,7 +67,8 @@ class ActorCritic(nn.Module):
             self.actor_obs_normalizer = torch.nn.Identity()
 
         # Critic
-        self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
+        self.critic_num_outputs = critic_num_outputs
+        self.critic = MLP(num_critic_obs, critic_num_outputs, critic_hidden_dims, activation)
         print(f"Critic MLP: {self.critic}")
 
         # Critic observation normalization

@@ -15,7 +15,7 @@ from tensordict import TensorDict
 from amtl.modules import ActorCriticRecurrent
 from amtl.modules.rnd import RandomNetworkDistillation
 from amtl.storage import RolloutStorage
-from amtl.utils import string_to_callable
+from amtl.utils import resolve_optimizer, string_to_callable
 
 from amtl.actor_critic import ActorCritic
 
@@ -128,6 +128,7 @@ class PPO:
         value_loss_coef: float = 1.0,
         entropy_coef: float = 0.01,
         learning_rate: float = 0.001,
+        optimizer: str = "adam",
         max_grad_norm: float = 1.0,
         use_clipped_value_loss: bool = True,
         schedule: str = "adaptive",
@@ -197,7 +198,8 @@ class PPO:
         self.policy.to(self.device)
 
         # Create optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        optimizer_cls = resolve_optimizer(optimizer)
+        self.optimizer = optimizer_cls(self.policy.parameters(), lr=learning_rate)
 
         # Create rollout storage
         self.storage: RolloutStorage | None = None
@@ -293,6 +295,7 @@ class PPO:
         num_transitions_per_env: int,
         obs: TensorDict,
         actions_shape: tuple[int] | list[int],
+        value_shape: tuple[int] | list[int] = (1,),
     ) -> None:
         # Create rollout storage
         self.storage = RolloutStorage(
@@ -301,6 +304,7 @@ class PPO:
             num_transitions_per_env,
             obs,
             actions_shape,
+            value_shape,
             self.device,
         )
 
@@ -340,10 +344,11 @@ class PPO:
 
         # Bootstrapping on time outs
         if "time_outs" in extras:
-            timeout_bonus = self.gamma * torch.squeeze(
-                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
-            )
-            self.transition.rewards += timeout_bonus
+            timeout_mask = extras["time_outs"].unsqueeze(1).to(self.device)
+            timeout_bonus = self.gamma * self.transition.values * timeout_mask
+            self.transition.rewards += timeout_bonus.sum(dim=-1)
+            if reward_terms is not None and timeout_bonus.shape[-1] == reward_terms.shape[-1]:
+                reward_terms = reward_terms + timeout_bonus
 
         self.transition.reward_terms = reward_terms
 
@@ -396,10 +401,6 @@ class PPO:
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
                     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
-                    if advantages_by_term_batch is not None:
-                        term_mean = advantages_by_term_batch.mean(dim=0, keepdim=True)
-                        term_std = advantages_by_term_batch.std(dim=0, keepdim=True)
-                        advantages_by_term_batch = (advantages_by_term_batch - term_mean) / (term_std + 1e-8)
 
             # Perform symmetric augmentation
             if self.symmetry and self.symmetry["use_data_augmentation"]:
@@ -473,54 +474,33 @@ class PPO:
 
 
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
-            surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_loss = surrogate.mean()
             surrogate_losses_by_term = None
 
-            if advantages_by_term_batch is not None:
-                surrogate_by_term = -advantages_by_term_batch * ratio.unsqueeze(-1)
-                surrogate_losses_by_term = surrogate_by_term.mean(dim=0)
-                surrogate_loss = surrogate_losses_by_term.mean()
-
-            value_loss = (returns_batch - value_batch).pow(2).mean()
-            auxiliary_loss = self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
-
-
-            '''
-            # Surrogate loss by term now that we have the option to do gradient surgery on each term separately
-            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
-            surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
-                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
-            )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
-            surrogate_losses_by_term = None
-        
-            
-            #for ppo
             if advantages_by_term_batch is not None:
                 ratio_by_term = ratio.unsqueeze(-1)
                 clipped_ratio_by_term = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param).unsqueeze(-1)
                 surrogate_by_term = -advantages_by_term_batch * ratio_by_term
                 surrogate_clipped_by_term = -advantages_by_term_batch * clipped_ratio_by_term
                 surrogate_losses_by_term = torch.max(surrogate_by_term, surrogate_clipped_by_term).mean(dim=0)
-                surrogate_loss = surrogate_losses_by_term.mean()
-                #print("advantages_by_term_batch:", advantages_by_term_batch.shape)
-           '''
-
+                surrogate_loss = surrogate_losses_by_term.sum()
+            else:
+                scalar_advantages = torch.squeeze(advantages_batch, dim=-1)
+                surrogate = -scalar_advantages * ratio
+                surrogate_clipped = -scalar_advantages * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+                surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
             # Value function loss
-            # if self.use_clipped_value_loss:
-            #     value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
-            #         -self.clip_param, self.clip_param
-            #     )
-            #     value_losses = (value_batch - returns_batch).pow(2)
-            #     value_losses_clipped = (value_clipped - returns_batch).pow(2)
-            #     value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            # else:
-            #     value_loss = (returns_batch - value_batch).pow(2).mean()
+            if self.use_clipped_value_loss:
+                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                    -self.clip_param, self.clip_param
+                )
+                value_losses = (value_batch - returns_batch).pow(2)
+                value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                value_loss = torch.max(value_losses, value_losses_clipped).mean()
+            else:
+                value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            # auxiliary_loss = self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            auxiliary_loss = self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             # Symmetry loss
             if self.symmetry:
@@ -573,33 +553,7 @@ class PPO:
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
 
-
-
-
-
-
-
-            if surrogate_losses_by_term is not None:
-                grads = []
-                for loss in surrogate_losses_by_term:
-                    for p in self.policy.parameters():
-                        if p.grad is not None:
-                            p.grad.data.zero_()
-                    loss.backward(retain_graph=True)
-                    grad = torch.cat([p.grad.flatten().clone() if p.grad is not None else torch.zeros_like(p).flatten() for p in self.policy.parameters()])
-                    grads.append(grad)
-
-                for p in self.policy.parameters():
-                    if p.grad is not None:
-                        p.grad.data.zero_()
-
-                grads = torch.stack(grads, dim=0)
-                grads, weights, singulars = ProcrustesSolver.apply(grads.T.unsqueeze(0))
-                grad, weights = grads[0].sum(-1), weights.sum(-1)
-                set_shared_grad(self.policy.parameters(), grad)
-                auxiliary_loss.backward()
-            else:
-                (surrogate_loss + auxiliary_loss).backward()
+            (surrogate_loss + auxiliary_loss).backward()
 
             # self.optimizer.step()
 
@@ -655,27 +609,9 @@ class PPO:
             if self.is_multi_gpu:
                 self.reduce_parameters()
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
             # Apply the gradients for PPO
-          #  nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
-           # self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()

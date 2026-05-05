@@ -9,6 +9,9 @@ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 1000
     experiment_name = "beyond_mimic"
     empirical_normalization = True
+    # The local AMTL runner expects an explicit policy observation set and will
+    # infer the critic observations from the environment when not provided.
+    obs_groups = {"policy": ["policy"]}
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_hidden_dims=[512, 256, 128],

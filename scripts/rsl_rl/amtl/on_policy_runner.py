@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import statistics
 import time
@@ -39,7 +40,7 @@ class OnPolicyRunner:
         self.save_interval = self.cfg["save_interval"]
 
         # Query observations from environment for algorithm construction
-        obs = self.env.get_observations()
+        obs = self._extract_observations(self.env.get_observations())
         default_sets = ["critic"]
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
@@ -71,7 +72,7 @@ class OnPolicyRunner:
             )
 
         # Start learning
-        obs = self.env.get_observations().to(self.device)
+        obs = self._extract_observations(self.env.get_observations()).to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping
@@ -173,6 +174,13 @@ class OnPolicyRunner:
         # Save the final model after training
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+
+    @staticmethod
+    def _extract_observations(obs_data: TensorDict | tuple[TensorDict, dict]) -> TensorDict:
+        """Normalize environment outputs that may return either `obs` or `(obs, extras)`."""
+        if isinstance(obs_data, tuple):
+            return obs_data[0]
+        return obs_data
 
     def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:
         # Compute the collection size
@@ -414,18 +422,24 @@ class OnPolicyRunner:
                 self.policy_cfg["critic_obs_normalization"] = self.cfg["empirical_normalization"]
 
         # Initialize the policy
+        reward_manager = getattr(self.env.unwrapped, "reward_manager", None)
+        if reward_manager is not None and getattr(reward_manager, "active_terms", None):
+            self.policy_cfg.setdefault("critic_num_outputs", len(reward_manager.active_terms))
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
         actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
             obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
+        sample_values = actor_critic.evaluate(obs).detach()
+
         # Initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
+        alg_cfg = self._filter_algorithm_cfg(alg_class, self.alg_cfg)
         alg: PPO = alg_class(
             actor_critic,
             device=self.device,
             env=self.env,
-            **self.alg_cfg,
+            **alg_cfg,
             multi_gpu_cfg=self.multi_gpu_cfg,
         )
 
@@ -436,6 +450,7 @@ class OnPolicyRunner:
             self.num_steps_per_env,
             obs,
             [self.env.num_actions],
+            tuple(sample_values.shape[1:]),
         )
 
         return alg
@@ -463,3 +478,25 @@ class OnPolicyRunner:
                 self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
             else:
                 raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
+
+    @staticmethod
+    def _filter_algorithm_cfg(alg_class, alg_cfg: dict) -> dict:
+        """Drop config keys unsupported by the local algorithm implementation."""
+        valid_keys = set(inspect.signature(alg_class.__init__).parameters.keys())
+        valid_keys.discard("self")
+
+        filtered_cfg = {}
+        dropped_keys = []
+        for key, value in alg_cfg.items():
+            if key in valid_keys:
+                filtered_cfg[key] = value
+            else:
+                dropped_keys.append(key)
+
+        if dropped_keys:
+            warnings.warn(
+                "Ignoring unsupported algorithm config keys for the local AMTL PPO implementation: "
+                f"{sorted(dropped_keys)}"
+            )
+
+        return filtered_cfg
