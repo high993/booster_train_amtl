@@ -9,6 +9,10 @@ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 1000
     experiment_name = "beyond_mimic"
     empirical_normalization = True
+    obs_groups = {
+        "policy": ["policy"],
+        "critic": ["critic"],
+    }
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_hidden_dims=[512, 256, 128],

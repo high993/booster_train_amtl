@@ -39,7 +39,7 @@ class OnPolicyRunner:
         self.save_interval = self.cfg["save_interval"]
 
         # Query observations from environment for algorithm construction
-        obs = self.env.get_observations()
+        obs = self._extract_observations(self.env.get_observations())
         default_sets = ["critic"]
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
@@ -60,6 +60,12 @@ class OnPolicyRunner:
         self.current_learning_iteration = 0
         self.git_status_repos = [__file__]
 
+    @staticmethod
+    def _extract_observations(obs: TensorDict | tuple[TensorDict, dict]) -> TensorDict:
+        if isinstance(obs, tuple):
+            return obs[0]
+        return obs
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Initialize writer
         self._prepare_logging_writer()
@@ -71,7 +77,7 @@ class OnPolicyRunner:
             )
 
         # Start learning
-        obs = self.env.get_observations().to(self.device)
+        obs = self._extract_observations(self.env.get_observations()).to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping

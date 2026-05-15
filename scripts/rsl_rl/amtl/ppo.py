@@ -15,9 +15,32 @@ from tensordict import TensorDict
 from amtl.modules import ActorCriticRecurrent
 from amtl.modules.rnd import RandomNetworkDistillation
 from amtl.storage import RolloutStorage
-from amtl.utils import string_to_callable
+from amtl.utils import resolve_optimizer, string_to_callable
 
 from amtl.actor_critic import ActorCritic
+
+
+MOTION_AMTL_TERM_NAMES = (
+    "motion_global_anchor_pos",
+    "motion_global_anchor_ori",
+    "motion_body_pos",
+    "motion_body_ori",
+    "motion_body_lin_vel",
+    "motion_body_ang_vel",
+    "motion_foot_ori",
+    "motion_foot_pos",
+    "motion_hand_ori",
+    "motion_hand_pos",
+    "motion_trunk_ori",
+    "motion_trunk_pos",
+    "motion_trunk_ang_vel",
+)
+
+REGULARIZER_TERM_NAMES = (
+    "action_rate_l2",
+    "joint_limit",
+    "undesired_contacts",
+)
 
 
 
@@ -128,10 +151,12 @@ class PPO:
         value_loss_coef: float = 1.0,
         entropy_coef: float = 0.01,
         learning_rate: float = 0.001,
+        optimizer: str = "adam",
         max_grad_norm: float = 1.0,
         use_clipped_value_loss: bool = True,
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
+        share_cnn_encoders: bool = False,
         device: str = "cpu",
         env=None,
         normalize_advantage_per_mini_batch: bool = False,
@@ -197,7 +222,8 @@ class PPO:
         self.policy.to(self.device)
 
         # Create optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        optimizer_class = resolve_optimizer(optimizer)
+        self.optimizer = optimizer_class(self.policy.parameters(), lr=learning_rate)
 
         # Create rollout storage
         self.storage: RolloutStorage | None = None
@@ -216,7 +242,9 @@ class PPO:
         self.desired_kl = desired_kl
         self.schedule = schedule
         self.learning_rate = learning_rate
+        self.share_cnn_encoders = share_cnn_encoders
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+        self._hybrid_term_indices: tuple[list[int], list[int]] | None = None
 
     def _get_reward_manager(self):
         if self.env is None:
@@ -239,6 +267,51 @@ class PPO:
         if hasattr(reward_manager, "step_reward_weighted"):
             return reward_manager.step_reward_weighted.detach().clone()
         return None
+
+    def _get_reward_term_names(self) -> list[str] | None:
+        reward_manager = self._get_reward_manager()
+        if reward_manager is None or not hasattr(reward_manager, "active_terms"):
+            return None
+        return list(reward_manager.active_terms)
+
+    def _get_hybrid_term_indices(self) -> tuple[list[int], list[int]] | None:
+        if self._hybrid_term_indices is not None:
+            return self._hybrid_term_indices
+
+        reward_term_names = self._get_reward_term_names()
+        if reward_term_names is None:
+            return None
+
+        term_to_index = {name: index for index, name in enumerate(reward_term_names)}
+        missing_motion = [name for name in MOTION_AMTL_TERM_NAMES if name not in term_to_index]
+        missing_regularizers = [name for name in REGULARIZER_TERM_NAMES if name not in term_to_index]
+
+        if missing_motion or missing_regularizers:
+            missing_terms = missing_motion + missing_regularizers
+            raise ValueError(
+                "Hybrid AMTL reward split could not be resolved. Missing reward terms: "
+                f"{missing_terms}. Active terms: {reward_term_names}"
+            )
+
+        motion_indices = [term_to_index[name] for name in MOTION_AMTL_TERM_NAMES]
+        regularizer_indices = [term_to_index[name] for name in REGULARIZER_TERM_NAMES]
+        self._hybrid_term_indices = (motion_indices, regularizer_indices)
+        return self._hybrid_term_indices
+
+    @staticmethod
+    def _zero_existing_grads(params: Sequence[torch.nn.Parameter]) -> None:
+        for param in params:
+            if param.grad is not None:
+                param.grad.data.zero_()
+
+    @staticmethod
+    def _collect_flat_grad(params: Sequence[torch.nn.Parameter]) -> torch.Tensor:
+        return torch.cat(
+            [
+                param.grad.flatten().clone() if param.grad is not None else torch.zeros_like(param).flatten()
+                for param in params
+            ]
+        )
     '''
     def _flatten_grad_list(
         self, grads: Sequence[torch.Tensor | None], params: Sequence[torch.nn.Parameter]
@@ -580,23 +653,45 @@ class PPO:
 
 
             if surrogate_losses_by_term is not None:
-                grads = []
-                for loss in surrogate_losses_by_term:
-                    for p in self.policy.parameters():
-                        if p.grad is not None:
-                            p.grad.data.zero_()
-                    loss.backward(retain_graph=True)
-                    grad = torch.cat([p.grad.flatten().clone() if p.grad is not None else torch.zeros_like(p).flatten() for p in self.policy.parameters()])
-                    grads.append(grad)
+                hybrid_term_indices = self._get_hybrid_term_indices()
+                params = list(self.policy.parameters())
 
-                for p in self.policy.parameters():
-                    if p.grad is not None:
-                        p.grad.data.zero_()
+                if hybrid_term_indices is None:
+                    grads = []
+                    for loss in surrogate_losses_by_term:
+                        self._zero_existing_grads(params)
+                        loss.backward(retain_graph=True)
+                        grads.append(self._collect_flat_grad(params))
 
-                grads = torch.stack(grads, dim=0)
-                grads, weights, singulars = ProcrustesSolver.apply(grads.T.unsqueeze(0))
-                grad, weights = grads[0].sum(-1), weights.sum(-1)
-                set_shared_grad(self.policy.parameters(), grad)
+                    self._zero_existing_grads(params)
+                    grads = torch.stack(grads, dim=0)
+                    grads, weights, singulars = ProcrustesSolver.apply(grads.T.unsqueeze(0))
+                    grad = grads[0].sum(-1)
+                    set_shared_grad(params, grad)
+                else:
+                    motion_indices, regularizer_indices = hybrid_term_indices
+
+                    motion_grads = []
+                    for idx in motion_indices:
+                        self._zero_existing_grads(params)
+                        surrogate_losses_by_term[idx].backward(retain_graph=True)
+                        motion_grads.append(self._collect_flat_grad(params))
+
+                    self._zero_existing_grads(params)
+                    motion_grads = torch.stack(motion_grads, dim=0)
+                    aligned_motion_grads, weights, singulars = ProcrustesSolver.apply(
+                        motion_grads.T.unsqueeze(0)
+                    )
+                    aligned_motion_grad = aligned_motion_grads[0].sum(-1)
+
+                    regularizer_loss = surrogate_losses_by_term[regularizer_indices].sum()
+                    regularizer_loss.backward(retain_graph=True)
+                    regularizer_grad = self._collect_flat_grad(params)
+
+                    self._zero_existing_grads(params)
+                    total_actor_grad = aligned_motion_grad + regularizer_grad
+                    set_shared_grad(params, total_actor_grad)
+
                 auxiliary_loss.backward()
             else:
                 (surrogate_loss + auxiliary_loss).backward()
