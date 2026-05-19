@@ -61,6 +61,43 @@ class OnPolicyRunner:
         self.current_learning_iteration = 0
         self.git_status_repos = [__file__]
 
+    def _find_non_finite_env_ids(
+        self, obs: TensorDict, rewards: torch.Tensor | None = None, dones: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        bad_mask = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device)
+
+        for value in obs.values():
+            flat_value = value.reshape(value.shape[0], -1)
+            bad_mask |= ~torch.isfinite(flat_value).all(dim=1)
+
+        if rewards is not None:
+            bad_mask |= ~torch.isfinite(rewards.reshape(rewards.shape[0], -1)).all(dim=1)
+
+        if dones is not None:
+            bad_mask |= ~torch.isfinite(dones.reshape(dones.shape[0], -1)).all(dim=1)
+
+        return bad_mask.nonzero(as_tuple=False).squeeze(-1)
+
+    def _recover_bad_envs(
+        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict
+    ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict, int]:
+        bad_env_ids = self._find_non_finite_env_ids(obs, rewards, dones)
+        if len(bad_env_ids) == 0:
+            return obs, rewards, dones, extras, 0
+
+        self.env.unwrapped._reset_idx(bad_env_ids.to(self.env.device))
+        refreshed_obs = self._extract_observations(self.env.get_observations()).to(self.device)
+
+        for key in obs.keys():
+            obs[key][bad_env_ids] = refreshed_obs[key][bad_env_ids]
+
+        rewards[bad_env_ids] = 0.0
+        dones[bad_env_ids] = 1
+        if "time_outs" in extras:
+            extras["time_outs"][bad_env_ids.to(extras["time_outs"].device)] = False
+
+        return obs, rewards, dones, extras, len(bad_env_ids)
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Initialize writer
         self._prepare_logging_writer()
@@ -73,6 +110,10 @@ class OnPolicyRunner:
 
         # Start learning
         obs = self._extract_observations(self.env.get_observations()).to(self.device)
+        initial_bad_envs = self._find_non_finite_env_ids(obs)
+        if len(initial_bad_envs) > 0:
+            self.env.unwrapped._reset_idx(initial_bad_envs.to(self.env.device))
+            obs = self._extract_observations(self.env.get_observations()).to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping
@@ -99,6 +140,7 @@ class OnPolicyRunner:
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.time()
+            recovered_env_count = 0
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
@@ -108,6 +150,8 @@ class OnPolicyRunner:
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    obs, rewards, dones, extras, recovered_count = self._recover_bad_envs(obs, rewards, dones, extras)
+                    recovered_env_count += recovered_count
                     # Process the step
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     # Extract intrinsic rewards (only for logging)
@@ -148,6 +192,7 @@ class OnPolicyRunner:
 
             # Update policy
             loss_dict = self.alg.update()
+            loss_dict["recovered_envs"] = float(recovered_env_count)
 
             stop = time.time()
             learn_time = stop - start
@@ -303,8 +348,11 @@ class OnPolicyRunner:
             "model_state_dict": self.alg.policy.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
+            "alg_update_counter": getattr(self.alg, "update_counter", None),
             "infos": infos,
         }
+        if getattr(self.alg, "ref_policy", None) is not None:
+            saved_dict["ref_model_state_dict"] = self.alg.ref_policy.state_dict()
         # Save RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
@@ -319,6 +367,14 @@ class OnPolicyRunner:
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
         # Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
+        if getattr(self.alg, "ref_policy", None) is not None:
+            ref_state_dict = loaded_dict.get("ref_model_state_dict")
+            if ref_state_dict is None:
+                warnings.warn(
+                    "Checkpoint is missing `ref_model_state_dict`; reinitializing the APA reference policy from the "
+                    "loaded actor policy."
+                )
+            self.alg.sync_reference_policy(ref_state_dict)
         # Load RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
@@ -332,6 +388,8 @@ class OnPolicyRunner:
         # Load current learning iteration
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]
+        if getattr(self.alg, "update_counter", None) is not None and loaded_dict.get("alg_update_counter") is not None:
+            self.alg.update_counter = loaded_dict["alg_update_counter"]
         return loaded_dict["infos"]
 
     def get_inference_policy(self, device: str | None = None) -> callable:
@@ -343,6 +401,8 @@ class OnPolicyRunner:
     def train_mode(self) -> None:
         # PPO
         self.alg.policy.train()
+        if getattr(self.alg, "ref_policy", None) is not None:
+            self.alg.ref_policy.eval()
         # RND
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.train()
@@ -350,6 +410,8 @@ class OnPolicyRunner:
     def eval_mode(self) -> None:
         # PPO
         self.alg.policy.eval()
+        if getattr(self.alg, "ref_policy", None) is not None:
+            self.alg.ref_policy.eval()
         # RND
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.eval()
@@ -495,7 +557,7 @@ class OnPolicyRunner:
 
         if dropped_keys:
             warnings.warn(
-                "Ignoring unsupported algorithm config keys for the local AMTL PPO implementation: "
+                "Ignoring unsupported algorithm config keys for the local AMTL on-policy implementation: "
                 f"{sorted(dropped_keys)}"
             )
 

@@ -123,12 +123,30 @@ class ActorCritic(nn.Module):
     def entropy(self) -> torch.Tensor:
         return self.distribution.entropy().sum(dim=-1)
 
+    def _validate_distribution_params(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        if torch.isfinite(mean).all() and torch.isfinite(std).all():
+            return
+
+        mean_finite = torch.isfinite(mean)
+        std_finite = torch.isfinite(std)
+        mean_min = mean[mean_finite].min().item() if mean_finite.any() else float("nan")
+        mean_max = mean[mean_finite].max().item() if mean_finite.any() else float("nan")
+        std_min = std[std_finite].min().item() if std_finite.any() else float("nan")
+        std_max = std[std_finite].max().item() if std_finite.any() else float("nan")
+
+        raise RuntimeError(
+            "Non-finite action distribution parameters detected. "
+            f"mean_finite={mean_finite.all().item()} mean_min={mean_min:.6g} mean_max={mean_max:.6g} "
+            f"std_finite={std_finite.all().item()} std_min={std_min:.6g} std_max={std_max:.6g}"
+        )
+
     def _update_distribution(self, obs: TensorDict) -> None:
         if self.state_dependent_std:
             # Compute mean and standard deviation
             mean_and_std = self.actor(obs)
             if self.noise_std_type == "scalar":
-                mean, std = torch.unbind(mean_and_std, dim=-2)
+                mean, std_param = torch.unbind(mean_and_std, dim=-2)
+                std = std_param.abs().clamp_min(1e-6)
             elif self.noise_std_type == "log":
                 mean, log_std = torch.unbind(mean_and_std, dim=-2)
                 std = torch.exp(log_std)
@@ -139,18 +157,22 @@ class ActorCritic(nn.Module):
             mean = self.actor(obs)
             # Compute standard deviation
             if self.noise_std_type == "scalar":
-                std = self.std.expand_as(mean)
+                std = self.std.abs().clamp_min(1e-6).expand_as(mean)
             elif self.noise_std_type == "log":
                 std = torch.exp(self.log_std).expand_as(mean)
             else:
                 raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        self._validate_distribution_params(mean, std)
         # Create distribution
         self.distribution = Normal(mean, std)
 
-    def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
+    def update_distribution(self, obs: TensorDict, **kwargs: dict[str, Any]) -> None:
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
         self._update_distribution(obs)
+
+    def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
+        self.update_distribution(obs, **kwargs)
         return self.distribution.sample()
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:

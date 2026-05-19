@@ -33,6 +33,16 @@ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         max_grad_norm=1.0,
     )
 
+    def __post_init__(self):
+        super().__post_init__()
+        self.algorithm.actor_loss_mode = "apa"
+        self.algorithm.apa_beta = 0.1
+        self.algorithm.apa_normalize_advantage = False
+        self.algorithm.apa_target_shift_clip = 1.0
+        self.algorithm.schedule = "fixed"
+        self.algorithm.desired_kl = None
+        self.algorithm.ref_policy_sync_interval = 20
+
 
 LOW_FREQ_SCALE = 0.5
 
