@@ -1,0 +1,469 @@
+--- git status ---
+On branch 260415/exported-policy-visualize
+Your branch is up to date with 'origin/260415/exported-policy-visualize'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   scripts/rsl_rl/amtl/actor_critic.py
+	modified:   scripts/rsl_rl/amtl/modules/actor_critic_recurrent.py
+	modified:   scripts/rsl_rl/amtl/on_policy_runner.py
+	modified:   scripts/rsl_rl/amtl/ppo.py
+	modified:   scripts/rsl_rl/amtl/storage/rollout_storage.py
+	modified:   scripts/rsl_rl/play.py
+	modified:   source/booster_train/booster_train/tasks/manager_based/beyond_mimic/agents/rsl_rl_ppo_cfg.py
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/scripts/rsl_rl/amtl/actor_critic.py b/scripts/rsl_rl/amtl/actor_critic.py
+index dbf24d1..84c3f2f 100644
+--- a/scripts/rsl_rl/amtl/actor_critic.py
++++ b/scripts/rsl_rl/amtl/actor_critic.py
+@@ -22,6 +22,7 @@ class ActorCritic(nn.Module):
+         obs: TensorDict,
+         obs_groups: dict[str, list[str]],
+         num_actions: int,
++        critic_num_outputs: int = 1,
+         actor_obs_normalization: bool = False,
+         critic_obs_normalization: bool = False,
+         actor_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
+@@ -66,7 +67,8 @@ class ActorCritic(nn.Module):
+             self.actor_obs_normalizer = torch.nn.Identity()
+ 
+         # Critic
+-        self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
++        self.critic_num_outputs = critic_num_outputs
++        self.critic = MLP(num_critic_obs, critic_num_outputs, critic_hidden_dims, activation)
+         print(f"Critic MLP: {self.critic}")
+ 
+         # Critic observation normalization
+diff --git a/scripts/rsl_rl/amtl/modules/actor_critic_recurrent.py b/scripts/rsl_rl/amtl/modules/actor_critic_recurrent.py
+index eeb3fd5..e4fa700 100644
+--- a/scripts/rsl_rl/amtl/modules/actor_critic_recurrent.py
++++ b/scripts/rsl_rl/amtl/modules/actor_critic_recurrent.py
+@@ -23,6 +23,7 @@ class ActorCriticRecurrent(nn.Module):
+         obs: TensorDict,
+         obs_groups: dict[str, list[str]],
+         num_actions: int,
++        critic_num_outputs: int = 1,
+         actor_obs_normalization: bool = False,
+         critic_obs_normalization: bool = False,
+         actor_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
+@@ -81,7 +82,8 @@ class ActorCriticRecurrent(nn.Module):
+ 
+         # Critic
+         self.memory_c = Memory(num_critic_obs, rnn_hidden_dim, rnn_num_layers, rnn_type)
+-        self.critic = MLP(rnn_hidden_dim, 1, critic_hidden_dims, activation)
++        self.critic_num_outputs = critic_num_outputs
++        self.critic = MLP(rnn_hidden_dim, critic_num_outputs, critic_hidden_dims, activation)
+         print(f"Critic RNN: {self.memory_c}")
+         print(f"Critic MLP: {self.critic}")
+ 
+diff --git a/scripts/rsl_rl/amtl/on_policy_runner.py b/scripts/rsl_rl/amtl/on_policy_runner.py
+index d9e76f3..1bf46bc 100644
+--- a/scripts/rsl_rl/amtl/on_policy_runner.py
++++ b/scripts/rsl_rl/amtl/on_policy_runner.py
+@@ -5,6 +5,7 @@
+ 
+ from __future__ import annotations
+ 
++import inspect
+ import os
+ import statistics
+ import time
+@@ -39,7 +40,7 @@ class OnPolicyRunner:
+         self.save_interval = self.cfg["save_interval"]
+ 
+         # Query observations from environment for algorithm construction
+-        obs = self.env.get_observations()
++        obs = self._extract_observations(self.env.get_observations())
+         default_sets = ["critic"]
+         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
+             default_sets.append("rnd_state")
+@@ -71,7 +72,7 @@ class OnPolicyRunner:
+             )
+ 
+         # Start learning
+-        obs = self.env.get_observations().to(self.device)
++        obs = self._extract_observations(self.env.get_observations()).to(self.device)
+         self.train_mode()  # switch to train mode (for dropout for example)
+ 
+         # Book keeping
+@@ -174,6 +175,13 @@ class OnPolicyRunner:
+         if self.log_dir is not None and not self.disable_logs:
+             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+ 
++    @staticmethod
++    def _extract_observations(obs_data: TensorDict | tuple[TensorDict, dict]) -> TensorDict:
++        """Normalize environment outputs that may return either `obs` or `(obs, extras)`."""
++        if isinstance(obs_data, tuple):
++            return obs_data[0]
++        return obs_data
++
+     def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:
+         # Compute the collection size
+         collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
+@@ -414,18 +422,24 @@ class OnPolicyRunner:
+                 self.policy_cfg["critic_obs_normalization"] = self.cfg["empirical_normalization"]
+ 
+         # Initialize the policy
++        reward_manager = getattr(self.env.unwrapped, "reward_manager", None)
++        if reward_manager is not None and getattr(reward_manager, "active_terms", None):
++            self.policy_cfg.setdefault("critic_num_outputs", len(reward_manager.active_terms))
+         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
+         actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
+             obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
+         ).to(self.device)
+ 
++        sample_values = actor_critic.evaluate(obs).detach()
++
+         # Initialize the algorithm
+         alg_class = eval(self.alg_cfg.pop("class_name"))
++        alg_cfg = self._filter_algorithm_cfg(alg_class, self.alg_cfg)
+         alg: PPO = alg_class(
+             actor_critic,
+             device=self.device,
+             env=self.env,
+-            **self.alg_cfg,
++            **alg_cfg,
+             multi_gpu_cfg=self.multi_gpu_cfg,
+         )
+ 
+@@ -436,6 +450,7 @@ class OnPolicyRunner:
+             self.num_steps_per_env,
+             obs,
+             [self.env.num_actions],
++            tuple(sample_values.shape[1:]),
+         )
+ 
+         return alg
+@@ -463,3 +478,25 @@ class OnPolicyRunner:
+                 self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+             else:
+                 raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
++
++    @staticmethod
++    def _filter_algorithm_cfg(alg_class, alg_cfg: dict) -> dict:
++        """Drop config keys unsupported by the local algorithm implementation."""
++        valid_keys = set(inspect.signature(alg_class.__init__).parameters.keys())
++        valid_keys.discard("self")
++
++        filtered_cfg = {}
++        dropped_keys = []
++        for key, value in alg_cfg.items():
++            if key in valid_keys:
++                filtered_cfg[key] = value
++            else:
++                dropped_keys.append(key)
++
++        if dropped_keys:
++            warnings.warn(
++                "Ignoring unsupported algorithm config keys for the local AMTL PPO implementation: "
++                f"{sorted(dropped_keys)}"
++            )
++
++        return filtered_cfg
+diff --git a/scripts/rsl_rl/amtl/ppo.py b/scripts/rsl_rl/amtl/ppo.py
+index 7c02555..fb411e4 100644
+--- a/scripts/rsl_rl/amtl/ppo.py
++++ b/scripts/rsl_rl/amtl/ppo.py
+@@ -15,7 +15,7 @@ from tensordict import TensorDict
+ from amtl.modules import ActorCriticRecurrent
+ from amtl.modules.rnd import RandomNetworkDistillation
+ from amtl.storage import RolloutStorage
+-from amtl.utils import string_to_callable
++from amtl.utils import resolve_optimizer, string_to_callable
+ 
+ from amtl.actor_critic import ActorCritic
+ 
+@@ -128,6 +128,7 @@ class PPO:
+         value_loss_coef: float = 1.0,
+         entropy_coef: float = 0.01,
+         learning_rate: float = 0.001,
++        optimizer: str = "adam",
+         max_grad_norm: float = 1.0,
+         use_clipped_value_loss: bool = True,
+         schedule: str = "adaptive",
+@@ -197,7 +198,8 @@ class PPO:
+         self.policy.to(self.device)
+ 
+         # Create optimizer
+-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
++        optimizer_cls = resolve_optimizer(optimizer)
++        self.optimizer = optimizer_cls(self.policy.parameters(), lr=learning_rate)
+ 
+         # Create rollout storage
+         self.storage: RolloutStorage | None = None
+@@ -293,6 +295,7 @@ class PPO:
+         num_transitions_per_env: int,
+         obs: TensorDict,
+         actions_shape: tuple[int] | list[int],
++        value_shape: tuple[int] | list[int] = (1,),
+     ) -> None:
+         # Create rollout storage
+         self.storage = RolloutStorage(
+@@ -301,6 +304,7 @@ class PPO:
+             num_transitions_per_env,
+             obs,
+             actions_shape,
++            value_shape,
+             self.device,
+         )
+ 
+@@ -340,10 +344,11 @@ class PPO:
+ 
+         # Bootstrapping on time outs
+         if "time_outs" in extras:
+-            timeout_bonus = self.gamma * torch.squeeze(
+-                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
+-            )
+-            self.transition.rewards += timeout_bonus
++            timeout_mask = extras["time_outs"].unsqueeze(1).to(self.device)
++            timeout_bonus = self.gamma * self.transition.values * timeout_mask
++            self.transition.rewards += timeout_bonus.sum(dim=-1)
++            if reward_terms is not None and timeout_bonus.shape[-1] == reward_terms.shape[-1]:
++                reward_terms = reward_terms + timeout_bonus
+ 
+         self.transition.reward_terms = reward_terms
+ 
+@@ -396,10 +401,6 @@ class PPO:
+             if self.normalize_advantage_per_mini_batch:
+                 with torch.no_grad():
+                     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+-                    if advantages_by_term_batch is not None:
+-                        term_mean = advantages_by_term_batch.mean(dim=0, keepdim=True)
+-                        term_std = advantages_by_term_batch.std(dim=0, keepdim=True)
+-                        advantages_by_term_batch = (advantages_by_term_batch - term_mean) / (term_std + 1e-8)
+ 
+             # Perform symmetric augmentation
+             if self.symmetry and self.symmetry["use_data_augmentation"]:
+@@ -473,54 +474,33 @@ class PPO:
+ 
+ 
+             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+-            surrogate = -torch.squeeze(advantages_batch) * ratio
+-            surrogate_loss = surrogate.mean()
+             surrogate_losses_by_term = None
+ 
+-            if advantages_by_term_batch is not None:
+-                surrogate_by_term = -advantages_by_term_batch * ratio.unsqueeze(-1)
+-                surrogate_losses_by_term = surrogate_by_term.mean(dim=0)
+-                surrogate_loss = surrogate_losses_by_term.mean()
+-
+-            value_loss = (returns_batch - value_batch).pow(2).mean()
+-            auxiliary_loss = self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+-
+-
+-            '''
+-            # Surrogate loss by term now that we have the option to do gradient surgery on each term separately
+-            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+-            surrogate = -torch.squeeze(advantages_batch) * ratio
+-            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
+-                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+-            )
+-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+-            surrogate_losses_by_term = None
+-        
+-            
+-            #for ppo
+             if advantages_by_term_batch is not None:
+                 ratio_by_term = ratio.unsqueeze(-1)
+                 clipped_ratio_by_term = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param).unsqueeze(-1)
+                 surrogate_by_term = -advantages_by_term_batch * ratio_by_term
+                 surrogate_clipped_by_term = -advantages_by_term_batch * clipped_ratio_by_term
+                 surrogate_losses_by_term = torch.max(surrogate_by_term, surrogate_clipped_by_term).mean(dim=0)
+-                surrogate_loss = surrogate_losses_by_term.mean()
+-                #print("advantages_by_term_batch:", advantages_by_term_batch.shape)
+-           '''
+-
++                surrogate_loss = surrogate_losses_by_term.sum()
++            else:
++                scalar_advantages = torch.squeeze(advantages_batch, dim=-1)
++                surrogate = -scalar_advantages * ratio
++                surrogate_clipped = -scalar_advantages * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
++                surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+ 
+             # Value function loss
+-            # if self.use_clipped_value_loss:
+-            #     value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+-            #         -self.clip_param, self.clip_param
+-            #     )
+-            #     value_losses = (value_batch - returns_batch).pow(2)
+-            #     value_losses_clipped = (value_clipped - returns_batch).pow(2)
+-            #     value_loss = torch.max(value_losses, value_losses_clipped).mean()
+-            # else:
+-            #     value_loss = (returns_batch - value_batch).pow(2).mean()
+-
+-            # auxiliary_loss = self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
++            if self.use_clipped_value_loss:
++                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
++                    -self.clip_param, self.clip_param
++                )
++                value_losses = (value_batch - returns_batch).pow(2)
++                value_losses_clipped = (value_clipped - returns_batch).pow(2)
++                value_loss = torch.max(value_losses, value_losses_clipped).mean()
++            else:
++                value_loss = (returns_batch - value_batch).pow(2).mean()
++
++            auxiliary_loss = self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+ 
+             # Symmetry loss
+             if self.symmetry:
+@@ -573,33 +553,7 @@ class PPO:
+             # Compute the gradients for PPO
+             self.optimizer.zero_grad()
+ 
+-
+-
+-
+-
+-
+-
+-            if surrogate_losses_by_term is not None:
+-                grads = []
+-                for loss in surrogate_losses_by_term:
+-                    for p in self.policy.parameters():
+-                        if p.grad is not None:
+-                            p.grad.data.zero_()
+-                    loss.backward(retain_graph=True)
+-                    grad = torch.cat([p.grad.flatten().clone() if p.grad is not None else torch.zeros_like(p).flatten() for p in self.policy.parameters()])
+-                    grads.append(grad)
+-
+-                for p in self.policy.parameters():
+-                    if p.grad is not None:
+-                        p.grad.data.zero_()
+-
+-                grads = torch.stack(grads, dim=0)
+-                grads, weights, singulars = ProcrustesSolver.apply(grads.T.unsqueeze(0))
+-                grad, weights = grads[0].sum(-1), weights.sum(-1)
+-                set_shared_grad(self.policy.parameters(), grad)
+-                auxiliary_loss.backward()
+-            else:
+-                (surrogate_loss + auxiliary_loss).backward()
++            (surrogate_loss + auxiliary_loss).backward()
+ 
+             # self.optimizer.step()
+ 
+@@ -655,27 +609,9 @@ class PPO:
+             if self.is_multi_gpu:
+                 self.reduce_parameters()
+ 
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+             # Apply the gradients for PPO
+-          #  nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
++            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+             self.optimizer.step()
+-           # self.optimizer.step()
+             # Apply the gradients for RND
+             if self.rnd_optimizer:
+                 self.rnd_optimizer.step()
+diff --git a/scripts/rsl_rl/amtl/storage/rollout_storage.py b/scripts/rsl_rl/amtl/storage/rollout_storage.py
+index a5148a9..fe43226 100644
+--- a/scripts/rsl_rl/amtl/storage/rollout_storage.py
++++ b/scripts/rsl_rl/amtl/storage/rollout_storage.py
+@@ -38,6 +38,7 @@ class RolloutStorage:
+         num_transitions_per_env: int,
+         obs: TensorDict,
+         actions_shape: tuple[int] | list[int],
++        value_shape: tuple[int] | list[int] = (1,),
+         device: str = "cpu",
+     ) -> None:
+         self.training_type = training_type
+@@ -45,6 +46,7 @@ class RolloutStorage:
+         self.num_transitions_per_env = num_transitions_per_env
+         self.num_envs = num_envs
+         self.actions_shape = actions_shape
++        self.value_shape = tuple(value_shape)
+ 
+         # Core
+         self.observations = TensorDict(
+@@ -63,12 +65,12 @@ class RolloutStorage:
+ 
+         # For reinforcement learning
+         if training_type == "rl":
+-            self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
++            self.values = torch.zeros(num_transitions_per_env, num_envs, *self.value_shape, device=self.device)
+             self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+             self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+             self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+-            self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+-            self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
++            self.returns = torch.zeros(num_transitions_per_env, num_envs, *self.value_shape, device=self.device)
++            self.advantages = torch.zeros(num_transitions_per_env, num_envs, *self.value_shape, device=self.device)
+             self.returns_by_term = None
+             self.advantages_by_term = None
+ 
+@@ -169,6 +171,20 @@ class RolloutStorage:
+     def compute_returns(
+         self, last_values: torch.Tensor, gamma: float, lam: float, normalize_advantage: bool = True
+     ) -> None:
++        if self.reward_terms is not None and self.values.shape[-1] == self.num_reward_terms:
++            advantage_by_term = torch.zeros(self.num_envs, self.num_reward_terms, device=self.device)
++            for step in reversed(range(self.num_transitions_per_env)):
++                next_values = last_values if step == self.num_transitions_per_env - 1 else self.values[step + 1]
++                next_is_not_terminal = 1.0 - self.dones[step].float()
++                delta_by_term = self.reward_terms[step] + next_is_not_terminal * gamma * next_values - self.values[step]
++                advantage_by_term = delta_by_term + next_is_not_terminal * gamma * lam * advantage_by_term
++                self.returns_by_term[step] = advantage_by_term + self.values[step]
++
++            self.advantages_by_term = self.returns_by_term - self.values
++            self.returns = self.returns_by_term.clone()
++            self.advantages = self.advantages_by_term.clone()
++            return
++
+         advantage = 0
+         for step in reversed(range(self.num_transitions_per_env)):
+             # If we are at the last step, bootstrap the return value
+diff --git a/scripts/rsl_rl/play.py b/scripts/rsl_rl/play.py
+index dd36e08..e8c9ca1 100644
+--- a/scripts/rsl_rl/play.py
++++ b/scripts/rsl_rl/play.py
+@@ -8,7 +8,6 @@
+ """Launch Isaac Sim Simulator first."""
+ 
+ import argparse
+-from importlib.metadata import version
+ import sys
+ 
+ from isaaclab.app import AppLauncher
+@@ -190,7 +189,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+ 
+     # reset environment
+     obs = env.get_observations()
+-    if version("rsl-rl-lib").startswith("2.3."):
++    if isinstance(obs, tuple):
+         obs, _ = obs
+     timestep = 0
+     # simulate environment
+diff --git a/source/booster_train/booster_train/tasks/manager_based/beyond_mimic/agents/rsl_rl_ppo_cfg.py b/source/booster_train/booster_train/tasks/manager_based/beyond_mimic/agents/rsl_rl_ppo_cfg.py
+index b625b14..0960d3f 100644
+--- a/source/booster_train/booster_train/tasks/manager_based/beyond_mimic/agents/rsl_rl_ppo_cfg.py
++++ b/source/booster_train/booster_train/tasks/manager_based/beyond_mimic/agents/rsl_rl_ppo_cfg.py
+@@ -9,6 +9,9 @@ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
+     save_interval = 1000
+     experiment_name = "beyond_mimic"
+     empirical_normalization = True
++    # The local AMTL runner expects an explicit policy observation set and will
++    # infer the critic observations from the environment when not provided.
++    obs_groups = {"policy": ["policy"]}
+     policy = RslRlPpoActorCriticCfg(
+         init_noise_std=1.0,
+         actor_hidden_dims=[512, 256, 128],

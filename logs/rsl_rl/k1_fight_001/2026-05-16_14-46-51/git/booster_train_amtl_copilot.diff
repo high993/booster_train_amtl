@@ -1,0 +1,228 @@
+--- git status ---
+On branch AMTL13
+Your branch is up to date with 'origin/AMTL13'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   scripts/rsl_rl/amtl/ppo.py
+	modified:   source/booster_train/booster_train/tasks/manager_based/beyond_mimic/agents/rsl_rl_ppo_cfg.py
+	modified:   source/booster_train/booster_train/tasks/manager_based/beyond_mimic/robots/k1/fight_001/tracking_env_cfg.py
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/scripts/rsl_rl/amtl/ppo.py b/scripts/rsl_rl/amtl/ppo.py
+index 5f67c3b..394d991 100644
+--- a/scripts/rsl_rl/amtl/ppo.py
++++ b/scripts/rsl_rl/amtl/ppo.py
+@@ -20,28 +20,26 @@ from amtl.utils import resolve_optimizer, string_to_callable
+ from amtl.actor_critic import ActorCritic
+ 
+ 
+-MOTION_AMTL_TERM_NAMES = (
+-    "motion_global_anchor_pos",
+-    "motion_global_anchor_ori",
+-    "motion_body_pos",
+-    "motion_body_ori",
+-    "motion_body_lin_vel",
+-    "motion_body_ang_vel",
+-    "motion_foot_ori",
+-    "motion_foot_pos",
+-    "motion_hand_ori",
+-    "motion_hand_pos",
+-    "motion_trunk_ori",
+-    "motion_trunk_pos",
+-    "motion_trunk_ang_vel",
++MOTION_AMTL_TERM_GROUPS = (
++    ("motion_global_anchor_pos", "motion_global_anchor_ori"),
++    ("motion_body_pos", "motion_body_ori"),
++    ("motion_body_lin_vel", "motion_body_ang_vel"),
++    ("motion_foot_ori", "motion_foot_pos"),
++    ("motion_hand_ori", "motion_hand_pos"),
++    ("motion_trunk_ori", "motion_trunk_pos", "motion_trunk_ang_vel"),
+ )
+ 
++MOTION_AMTL_TERM_NAMES = tuple(name for group in MOTION_AMTL_TERM_GROUPS for name in group)
++
+ REGULARIZER_TERM_NAMES = (
+     "action_rate_l2",
+     "joint_limit",
+     "undesired_contacts",
+ )
+ 
++AMTL_EXCLUDED_PARAM_NAMES = ("std", "log_std", "action_std")
++AMTL_MODES = {"none", "terms", "grouped6"}
++
+ 
+ 
+ 
+@@ -149,7 +147,7 @@ class PPO:
+         gamma: float = 0.99,
+         lam: float = 0.95,
+         value_loss_coef: float = 1.0,
+-        entropy_coef: float = 0.01,
++        entropy_coef: float = 0.001,
+         learning_rate: float = 0.001,
+         optimizer: str = "adam",
+         max_grad_norm: float = 1.0,
+@@ -157,6 +155,7 @@ class PPO:
+         schedule: str = "adaptive",
+         desired_kl: float = 0.01,
+         share_cnn_encoders: bool = False,
++        amtl_mode: str = "grouped6",
+         device: str = "cpu",
+         env=None,
+         normalize_advantage_per_mini_batch: bool = False,
+@@ -243,6 +242,9 @@ class PPO:
+         self.schedule = schedule
+         self.learning_rate = learning_rate
+         self.share_cnn_encoders = share_cnn_encoders
++        if amtl_mode not in AMTL_MODES:
++            raise ValueError(f"Unsupported amtl_mode '{amtl_mode}'. Expected one of {sorted(AMTL_MODES)}.")
++        self.amtl_mode = amtl_mode
+         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+         self._hybrid_term_indices: tuple[list[int], list[int]] | None = None
+ 
+@@ -293,7 +295,10 @@ class PPO:
+                 f"{missing_terms}. Active terms: {reward_term_names}"
+             )
+ 
+-        motion_indices = [term_to_index[name] for name in MOTION_AMTL_TERM_NAMES]
++        if self.amtl_mode == "grouped6":
++            motion_indices = [[term_to_index[name] for name in group] for group in MOTION_AMTL_TERM_GROUPS]
++        else:
++            motion_indices = [term_to_index[name] for name in MOTION_AMTL_TERM_NAMES]
+         regularizer_indices = [term_to_index[name] for name in REGULARIZER_TERM_NAMES]
+         self._hybrid_term_indices = (motion_indices, regularizer_indices)
+         return self._hybrid_term_indices
+@@ -304,6 +309,15 @@ class PPO:
+             if param.grad is not None:
+                 param.grad.data.zero_()
+ 
++    def _get_amtl_params(self) -> list[torch.nn.Parameter]:
++        amtl_params = []
++        for name, param in self.policy.named_parameters():
++            leaf_name = name.split(".")[-1]
++            if leaf_name in AMTL_EXCLUDED_PARAM_NAMES:
++                continue
++            amtl_params.append(param)
++        return amtl_params
++
+     @staticmethod
+     def _collect_flat_grad(params: Sequence[torch.nn.Parameter]) -> torch.Tensor:
+         return torch.cat(
+@@ -652,9 +666,9 @@ class PPO:
+ 
+ 
+ 
+-            if surrogate_losses_by_term is not None:
++            if surrogate_losses_by_term is not None and self.amtl_mode != "none":
+                 hybrid_term_indices = self._get_hybrid_term_indices()
+-                params = list(self.policy.parameters())
++                params = self._get_amtl_params()
+ 
+                 if hybrid_term_indices is None:
+                     grads = []
+@@ -671,10 +685,15 @@ class PPO:
+                 else:
+                     motion_indices, regularizer_indices = hybrid_term_indices
+ 
++                    if self.amtl_mode == "grouped6":
++                        motion_losses = [surrogate_losses_by_term[group_indices].mean() for group_indices in motion_indices]
++                    else:
++                        motion_losses = [surrogate_losses_by_term[idx] for idx in motion_indices]
++
+                     motion_grads = []
+-                    for idx in motion_indices:
++                    for motion_loss in motion_losses:
+                         self._zero_existing_grads(params)
+-                        surrogate_losses_by_term[idx].backward(retain_graph=True)
++                        motion_loss.backward(retain_graph=True)
+                         motion_grads.append(self._collect_flat_grad(params))
+ 
+                     self._zero_existing_grads(params)
+@@ -682,16 +701,44 @@ class PPO:
+                     aligned_motion_grads, weights, singulars = ProcrustesSolver.apply(
+                         motion_grads.T.unsqueeze(0)
+                     )
+-                    aligned_motion_grad = aligned_motion_grads[0].sum(-1)
++                    if self.amtl_mode == "grouped6":
++                        group_weights = torch.tensor(
++                            [1.5, 1.5, 1.0, 2.0, 0.5, 2.0],
++                            device=aligned_motion_grads.device,
++                            dtype=aligned_motion_grads.dtype,
++                        )
++                        group_weights = group_weights / group_weights.sum()
++                        aligned_motion_grad = (aligned_motion_grads[0] * group_weights.view(1, -1)).sum(-1)
++                    else:
++                        aligned_motion_grad = aligned_motion_grads[0].mean(-1)
+ 
+                     regularizer_loss = surrogate_losses_by_term[regularizer_indices].sum()
+                     regularizer_loss.backward(retain_graph=True)
+                     regularizer_grad = self._collect_flat_grad(params)
+ 
++                    eps = 1e-8
++                    beta = 0.1
++
++                    g_m = aligned_motion_grad
++                    g_r = regularizer_grad
++
++                    motion_norm = torch.norm(g_m)
++                    reg_norm = torch.norm(g_r)
++
++                    g_r_scaled = beta * (motion_norm / (reg_norm + eps)) * g_r
++
+                     self._zero_existing_grads(params)
+-                    total_actor_grad = aligned_motion_grad + regularizer_grad
++
++                    total_actor_grad = g_m + g_r_scaled
++
++                    print("aligned_motion_grad norm:", motion_norm.item())
++                    print("regularizer_grad norm:", reg_norm.item())
++                    print("scaled_regularizer_grad norm:", g_r_scaled.norm().item())
++                    print("total_actor_grad norm:", total_actor_grad.norm().item())
++
+                     set_shared_grad(params, total_actor_grad)
+ 
++
+                 auxiliary_loss.backward()
+             else:
+                 (surrogate_loss + auxiliary_loss).backward()
+diff --git a/source/booster_train/booster_train/tasks/manager_based/beyond_mimic/agents/rsl_rl_ppo_cfg.py b/source/booster_train/booster_train/tasks/manager_based/beyond_mimic/agents/rsl_rl_ppo_cfg.py
+index cd9336f..f4d4154 100644
+--- a/source/booster_train/booster_train/tasks/manager_based/beyond_mimic/agents/rsl_rl_ppo_cfg.py
++++ b/source/booster_train/booster_train/tasks/manager_based/beyond_mimic/agents/rsl_rl_ppo_cfg.py
+@@ -2,6 +2,11 @@ from isaaclab.utils import configclass
+ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
+ 
+ 
++@configclass
++class BoosterRslRlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
++    amtl_mode: str = "grouped6"
++
++
+ @configclass
+ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
+     num_steps_per_env = 24
+@@ -19,7 +24,7 @@ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
+         critic_hidden_dims=[512, 256, 128],
+         activation="elu",
+     )
+-    algorithm = RslRlPpoAlgorithmCfg(
++    algorithm = BoosterRslRlPpoAlgorithmCfg(
+         value_loss_coef=1.0,
+         use_clipped_value_loss=True,
+         clip_param=0.2,
+diff --git a/source/booster_train/booster_train/tasks/manager_based/beyond_mimic/robots/k1/fight_001/tracking_env_cfg.py b/source/booster_train/booster_train/tasks/manager_based/beyond_mimic/robots/k1/fight_001/tracking_env_cfg.py
+index 5d88799..42614e1 100644
+--- a/source/booster_train/booster_train/tasks/manager_based/beyond_mimic/robots/k1/fight_001/tracking_env_cfg.py
++++ b/source/booster_train/booster_train/tasks/manager_based/beyond_mimic/robots/k1/fight_001/tracking_env_cfg.py
+@@ -361,4 +361,4 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
+         # viewer settings
+         self.viewer.origin_type = "world"   # for rotation the view by mouse and keyboard
+         self.viewer.eye = (3.0, -4.0, 2.0)
+-        self.viewer.lookat = (0.0, 0.0, 1.0)
++        self.viewer.lookat = (0.0, 0.0, 1.0)
+\ No newline at end of file

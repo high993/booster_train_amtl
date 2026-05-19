@@ -1,0 +1,216 @@
+--- git status ---
+On branch amtl-multicritic-playback
+Your branch is up to date with 'origin/amtl-multicritic-playback'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   scripts/rsl_rl/amtl/ppo.py
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/scripts/rsl_rl/amtl/ppo.py b/scripts/rsl_rl/amtl/ppo.py
+index fb411e4..64596ae 100644
+--- a/scripts/rsl_rl/amtl/ppo.py
++++ b/scripts/rsl_rl/amtl/ppo.py
+@@ -20,6 +20,24 @@ from amtl.utils import resolve_optimizer, string_to_callable
+ from amtl.actor_critic import ActorCritic
+ 
+ 
++MOTION_AMTL_TERM_GROUPS = (
++    ("motion_global_anchor_pos", "motion_global_anchor_ori"),
++    ("motion_body_pos", "motion_body_ori"),
++    ("motion_body_lin_vel", "motion_body_ang_vel"),
++    ("motion_foot_ori", "motion_foot_pos"),
++    ("motion_hand_ori", "motion_hand_pos"),
++    ("motion_trunk_ori", "motion_trunk_pos", "motion_trunk_ang_vel"),
++)
++
++MOTION_AMTL_TERM_NAMES = tuple(name for group in MOTION_AMTL_TERM_GROUPS for name in group)
++
++REGULARIZER_TERM_NAMES = (
++    "action_rate_l2",
++    "joint_limit",
++    "undesired_contacts",
++)
++
++AMTL_EXCLUDED_PARAM_NAMES = ("std", "log_std", "action_std")
+ 
+ 
+ 
+@@ -28,15 +46,15 @@ from amtl.actor_critic import ActorCritic
+ def set_shared_grad(shared_params, grad_vec):
+     offset = 0
+     for p in shared_params:
+-        _offset = offset + p.numel()
+-        if p.grad is not None:
+-            p.grad.data = grad_vec[offset:_offset].view_as(p.grad)
+-        offset = _offset
+-        # if p.grad is None:
+-        #     continue
+-        # _offset = offset + p.grad.shape.numel()
+-        # p.grad.data = grad_vec[offset:_offset].view_as(p.grad)
+-        # offset = _offset
++        numel = p.numel()
++        grad = grad_vec[offset:offset + numel].view_as(p)
++
++        if p.grad is None:
++            p.grad = grad.clone()
++        else:
++            p.grad.data.copy_(grad)
++
++        offset += numel
+ 
+ 
+     
+@@ -241,6 +259,77 @@ class PPO:
+         if hasattr(reward_manager, "step_reward_weighted"):
+             return reward_manager.step_reward_weighted.detach().clone()
+         return None
++
++    def _get_reward_term_names(self) -> list[str] | None:
++        reward_manager = self._get_reward_manager()
++        if reward_manager is None or not hasattr(reward_manager, "active_terms"):
++            return None
++        return list(reward_manager.active_terms)
++
++    def _get_hybrid_term_indices(self):
++        reward_term_names = self._get_reward_term_names()
++        if reward_term_names is None:
++            return None
++
++        term_to_index = {name: index for index, name in enumerate(reward_term_names)}
++
++        motion_indices = [
++            [term_to_index[name] for name in group]
++            for group in MOTION_AMTL_TERM_GROUPS
++        ]
++
++        regularizer_indices = [
++            term_to_index[name]
++            for name in REGULARIZER_TERM_NAMES
++        ]
++
++        return motion_indices, regularizer_indices
++
++    def _get_amtl_params(self):
++        params = []
++        for name, param in self.policy.named_parameters():
++            if name.split(".")[-1] in AMTL_EXCLUDED_PARAM_NAMES:
++                continue
++            params.append(param)
++        return params
++
++    @staticmethod
++    def _zero_existing_grads(params):
++        for p in params:
++            if p.grad is not None:
++                p.grad.data.zero_()
++
++    @staticmethod
++    def _collect_flat_grad(params):
++        return torch.cat([
++            p.grad.flatten().clone() if p.grad is not None else torch.zeros_like(p).flatten()
++            for p in params
++        ])
++
++    def _advantage_alignment_weights(self, advantages_by_term_batch, motion_indices, eps=1e-8):
++        group_advantages = []
++
++        for group in motion_indices:
++            adv = advantages_by_term_batch[:, group].sum(dim=-1)
++            adv = (adv - adv.mean()) / (adv.std() + eps)
++            group_advantages.append(adv)
++
++        group_advantages = torch.stack(group_advantages, dim=0)
++
++        ref = group_advantages.mean(dim=0)
++        ref = (ref - ref.mean()) / (ref.std() + eps)
++
++        scores = torch.stack([
++            torch.mean(adv * ref)
++            for adv in group_advantages
++        ])
++
++        scores = torch.clamp(scores, min=0.0)
++
++        if scores.sum() < eps:
++            scores = torch.ones_like(scores)
++
++        return scores / (scores.sum() + eps)
+     '''
+     def _flatten_grad_list(
+         self, grads: Sequence[torch.Tensor | None], params: Sequence[torch.nn.Parameter]
+@@ -553,7 +642,69 @@ class PPO:
+             # Compute the gradients for PPO
+             self.optimizer.zero_grad()
+ 
+-            (surrogate_loss + auxiliary_loss).backward()
++            if surrogate_losses_by_term is not None:
++                hybrid_term_indices = self._get_hybrid_term_indices()
++                params = self._get_amtl_params()
++
++                if hybrid_term_indices is None:
++                    (surrogate_loss + auxiliary_loss).backward()
++                else:
++                    motion_indices, regularizer_indices = hybrid_term_indices
++
++                    motion_losses = [
++                        surrogate_losses_by_term[group].sum()
++                        for group in motion_indices
++                    ]
++
++                    motion_grads = []
++                    for motion_loss in motion_losses:
++                        self._zero_existing_grads(params)
++                        motion_loss.backward(retain_graph=True)
++                        motion_grads.append(self._collect_flat_grad(params))
++
++                    self._zero_existing_grads(params)
++
++                    motion_grads = torch.stack(motion_grads, dim=0)
++
++                    aligned_motion_grads, weights, singulars = ProcrustesSolver.apply(
++                        motion_grads.T.unsqueeze(0)
++                    )
++
++                    with torch.no_grad():
++                        group_weights = self._advantage_alignment_weights(
++                            advantages_by_term_batch.detach(),
++                            motion_indices,
++                        ).to(
++                            device=aligned_motion_grads.device,
++                            dtype=aligned_motion_grads.dtype,
++                        )
++
++                    aligned_motion_grad = (
++                        aligned_motion_grads[0] * group_weights.view(1, -1)
++                    ).sum(-1)
++
++                    regularizer_loss = surrogate_losses_by_term[regularizer_indices].sum()
++                    regularizer_loss.backward(retain_graph=True)
++                    regularizer_grad = self._collect_flat_grad(params)
++
++                    eps = 1e-8
++                    beta = 0.01
++
++                    motion_norm = torch.norm(aligned_motion_grad)
++                    reg_norm = torch.norm(regularizer_grad)
++
++                    regularizer_grad_scaled = beta * (
++                        motion_norm / (reg_norm + eps)
++                    ) * regularizer_grad
++
++                    total_actor_grad = aligned_motion_grad + regularizer_grad_scaled
++
++                    self._zero_existing_grads(params)
++                    set_shared_grad(params, total_actor_grad)
++
++                    auxiliary_loss.backward()
++            else:
++                (surrogate_loss + auxiliary_loss).backward()
+ 
+             # self.optimizer.step()
+ 
