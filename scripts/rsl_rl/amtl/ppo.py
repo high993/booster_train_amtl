@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import json
+import os
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -14,39 +17,11 @@ from tensordict import TensorDict
 
 from amtl.modules import ActorCriticRecurrent
 from amtl.modules.rnd import RandomNetworkDistillation
+from amtl.objective_metadata import get_objective_metadata
 from amtl.storage import RolloutStorage
 from amtl.utils import resolve_optimizer, string_to_callable
 
 from amtl.actor_critic import ActorCritic
-
-
-MOTION_AMTL_TERM_NAMES = (
-    "motion_global_anchor_pos",
-    "motion_global_anchor_ori",
-    "motion_body_pos",
-    "motion_body_ori",
-    "motion_body_lin_vel",
-    "motion_body_ang_vel",
-    "motion_foot_ori",
-    "motion_foot_pos",
-    "motion_hand_ori",
-    "motion_hand_pos",
-    "motion_trunk_ori",
-    "motion_trunk_pos",
-    "motion_trunk_ang_vel",
-)
-
-REGULARIZER_TERM_NAMES = (
-    "action_rate_l2",
-    "joint_limit",
-    "undesired_contacts",
-)
-
-
-
-
-
-
 
 def set_shared_grad(shared_params, grad_vec):
     offset = 0
@@ -55,11 +30,6 @@ def set_shared_grad(shared_params, grad_vec):
         if p.grad is not None:
             p.grad.data = grad_vec[offset:_offset].view_as(p.grad)
         offset = _offset
-        # if p.grad is None:
-        #     continue
-        # _offset = offset + p.grad.shape.numel()
-        # p.grad.data = grad_vec[offset:_offset].view_as(p.grad)
-        # offset = _offset
 
 
     
@@ -160,6 +130,14 @@ class PPO:
         device: str = "cpu",
         env=None,
         normalize_advantage_per_mini_batch: bool = False,
+        beta_reg: float = 0.5,
+        max_reg_scale: float = 1.0,
+        use_blended_actor_update: bool = True,
+        ppo_blend_weight: float = 0.8,
+        amtl_blend_weight: float = 0.2,
+        blend_schedule: str = "constant",
+        blend_transition_start: int = 5000,
+        blend_transition_end: int = 15000,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -244,7 +222,22 @@ class PPO:
         self.learning_rate = learning_rate
         self.share_cnn_encoders = share_cnn_encoders
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+        self.beta_reg = beta_reg
+        self.max_reg_scale = max_reg_scale
+        self.use_blended_actor_update = use_blended_actor_update
+        self.ppo_blend_weight = ppo_blend_weight
+        self.amtl_blend_weight = amtl_blend_weight
+        self.blend_schedule = blend_schedule
+        self.blend_transition_start = blend_transition_start
+        self.blend_transition_end = blend_transition_end
+        self.update_counter = 0
         self._hybrid_term_indices: tuple[list[int], list[int]] | None = None
+        self.latest_objective_cosine_matrix: torch.Tensor | None = None
+        self.log_dir: str | None = None
+        self._gradient_debug_dump_written = False
+
+    def set_log_dir(self, log_dir: str | None) -> None:
+        self.log_dir = log_dir
 
     def _get_reward_manager(self):
         if self.env is None:
@@ -282,19 +275,19 @@ class PPO:
         if reward_term_names is None:
             return None
 
-        term_to_index = {name: index for index, name in enumerate(reward_term_names)}
-        missing_motion = [name for name in MOTION_AMTL_TERM_NAMES if name not in term_to_index]
-        missing_regularizers = [name for name in REGULARIZER_TERM_NAMES if name not in term_to_index]
+        motion_indices = []
+        regularizer_indices = []
+        for index, name in enumerate(reward_term_names):
+            metadata = get_objective_metadata(name)
+            if metadata.is_penalty:
+                regularizer_indices.append(index)
+            else:
+                motion_indices.append(index)
 
-        if missing_motion or missing_regularizers:
-            missing_terms = missing_motion + missing_regularizers
-            raise ValueError(
-                "Hybrid AMTL reward split could not be resolved. Missing reward terms: "
-                f"{missing_terms}. Active terms: {reward_term_names}"
-            )
+        if len(motion_indices) == 0 or len(regularizer_indices) == 0:
+            self._hybrid_term_indices = None
+            return self._hybrid_term_indices
 
-        motion_indices = [term_to_index[name] for name in MOTION_AMTL_TERM_NAMES]
-        regularizer_indices = [term_to_index[name] for name in REGULARIZER_TERM_NAMES]
         self._hybrid_term_indices = (motion_indices, regularizer_indices)
         return self._hybrid_term_indices
 
@@ -312,6 +305,196 @@ class PPO:
                 for param in params
             ]
         )
+
+    @staticmethod
+    def _compute_parameter_grad_norm(params: Sequence[torch.nn.Parameter]) -> float:
+        grad_sq_sum = 0.0
+        for param in params:
+            if param.grad is None:
+                continue
+            grad_sq_sum += torch.sum(param.grad.detach() ** 2).item()
+        return grad_sq_sum ** 0.5
+
+    @staticmethod
+    def _compute_flat_subset_grad_norm(
+        params: Sequence[torch.nn.Parameter],
+        grad_vec: torch.Tensor,
+        subset_params: Sequence[torch.nn.Parameter],
+    ) -> float:
+        subset_param_ids = {id(param) for param in subset_params}
+        grad_sq_sum = 0.0
+        offset = 0
+        for param in params:
+            next_offset = offset + param.numel()
+            if id(param) in subset_param_ids:
+                grad_slice = grad_vec[offset:next_offset]
+                grad_sq_sum += torch.sum(grad_slice.detach() ** 2).item()
+            offset = next_offset
+        return grad_sq_sum ** 0.5
+
+    def _get_effective_blend_weights(self) -> tuple[float, float]:
+        if self.blend_schedule == "constant":
+            return self.ppo_blend_weight, self.amtl_blend_weight
+        if self.blend_schedule == "ppo_to_amtl":
+            if self.update_counter <= self.blend_transition_start:
+                return 1.0, 0.0
+            if self.update_counter >= self.blend_transition_end:
+                return self.ppo_blend_weight, self.amtl_blend_weight
+            transition_span = max(1, self.blend_transition_end - self.blend_transition_start)
+            alpha = (self.update_counter - self.blend_transition_start) / transition_span
+            effective_ppo = (1.0 - alpha) * 1.0 + alpha * self.ppo_blend_weight
+            effective_amtl = (1.0 - alpha) * 0.0 + alpha * self.amtl_blend_weight
+            return effective_ppo, effective_amtl
+        raise ValueError(f"Unsupported blend_schedule: {self.blend_schedule}")
+
+    @staticmethod
+    def _accumulate_objective_gradient_metrics(
+        sum_grad_norms: dict[str, float],
+        sum_grad_fractions: dict[str, float],
+        sum_aligned_projections: dict[str, float],
+        objective_names: Sequence[str],
+        grads: torch.Tensor,
+        aligned_grad: torch.Tensor,
+    ) -> None:
+        if grads.numel() == 0 or len(objective_names) == 0:
+            return
+
+        grad_norms = grads.norm(dim=1)
+        total_grad_norm = grad_norms.sum().clamp_min(1.0e-8)
+        aligned_grad_norm = aligned_grad.norm().clamp_min(1.0e-8)
+        projections = torch.sum(grads * aligned_grad.unsqueeze(0), dim=1) / (
+            grad_norms * aligned_grad_norm
+        ).clamp_min(1.0e-8)
+
+        for objective_name, grad_norm, grad_fraction, projection in zip(
+            objective_names,
+            grad_norms,
+            grad_norms / total_grad_norm,
+            projections,
+            strict=True,
+        ):
+            sum_grad_norms[objective_name] = sum_grad_norms.get(objective_name, 0.0) + grad_norm.item()
+            sum_grad_fractions[objective_name] = sum_grad_fractions.get(objective_name, 0.0) + grad_fraction.item()
+            sum_aligned_projections[objective_name] = (
+                sum_aligned_projections.get(objective_name, 0.0) + projection.item()
+            )
+
+    @staticmethod
+    def _compute_objective_fraction_summary(grads: torch.Tensor) -> dict[str, float]:
+        if grads.numel() == 0 or grads.shape[0] == 0:
+            return {
+                "top_objective_grad_fraction": 0.0,
+                "bottom_objective_grad_fraction": 0.0,
+                "objective_grad_fraction_entropy": 0.0,
+            }
+
+        grad_norms = grads.norm(dim=1)
+        grad_fractions = grad_norms / grad_norms.sum().clamp_min(1.0e-8)
+        safe_fractions = grad_fractions.clamp_min(1.0e-8)
+        return {
+            "top_objective_grad_fraction": grad_fractions.max().item(),
+            "bottom_objective_grad_fraction": grad_fractions.min().item(),
+            "objective_grad_fraction_entropy": (-(safe_fractions * safe_fractions.log()).sum()).item(),
+        }
+
+    def _write_first_update_gradient_debug(
+        self,
+        payload: dict,
+    ) -> None:
+        if self._gradient_debug_dump_written or self.log_dir is None:
+            return
+
+        os.makedirs(self.log_dir, exist_ok=True)
+        path = os.path.join(self.log_dir, "gradient_debug_first_update.json")
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(payload, file, indent=2, sort_keys=True)
+        self._gradient_debug_dump_written = True
+
+    @staticmethod
+    def _compute_objective_cosine_stats(
+        grads: torch.Tensor,
+    ) -> tuple[dict[str, float], torch.Tensor]:
+        num_objectives = grads.shape[0]
+        if num_objectives == 0:
+            zero_matrix = torch.zeros((0, 0), device=grads.device)
+            return {
+                "objective_mean_cosine": 0.0,
+                "objective_median_cosine": 0.0,
+                "objective_min_cosine": 0.0,
+                "objective_max_cosine": 0.0,
+                "objective_std_cosine": 0.0,
+                "objective_conflict_fraction": 0.0,
+            }, zero_matrix
+
+        normalized_grads = grads / grads.norm(dim=1, keepdim=True).clamp_min(1.0e-8)
+        cosine_matrix = torch.matmul(normalized_grads, normalized_grads.T).detach()
+
+        if num_objectives < 2:
+            return {
+                "objective_mean_cosine": 1.0,
+                "objective_median_cosine": 1.0,
+                "objective_min_cosine": 1.0,
+                "objective_max_cosine": 1.0,
+                "objective_std_cosine": 0.0,
+                "objective_conflict_fraction": 0.0,
+            }, cosine_matrix
+
+        pair_indices = torch.triu_indices(num_objectives, num_objectives, offset=1, device=grads.device)
+        pairwise_cosines = cosine_matrix[pair_indices[0], pair_indices[1]]
+
+        return {
+            "objective_mean_cosine": pairwise_cosines.mean().item(),
+            "objective_median_cosine": pairwise_cosines.median().item(),
+            "objective_min_cosine": pairwise_cosines.min().item(),
+            "objective_max_cosine": pairwise_cosines.max().item(),
+            "objective_std_cosine": pairwise_cosines.std(unbiased=False).item(),
+            "objective_conflict_fraction": (pairwise_cosines < 0).float().mean().item(),
+        }, cosine_matrix
+
+    @staticmethod
+    def _compute_objective_matrix_stats(grads: torch.Tensor) -> dict[str, float]:
+        num_objectives = grads.shape[0]
+        if num_objectives == 0:
+            return {
+                "objective_effective_rank": 0.0,
+                "objective_sv1_ratio": 0.0,
+                "objective_sv2_ratio": 0.0,
+                "objective_sv3_ratio": 0.0,
+                "objective_pca_var1": 0.0,
+                "objective_pca_var2": 0.0,
+                "objective_pca_var3": 0.0,
+            }
+
+        singular_values = torch.linalg.svdvals(grads)
+        singular_sum = singular_values.sum().clamp_min(1.0e-8)
+        singular_ratios = singular_values / singular_sum
+        effective_rank = torch.exp(
+            -(singular_ratios * torch.log(singular_ratios.clamp_min(1.0e-8))).sum()
+        ).item()
+
+        centered_grads = grads - grads.mean(dim=0, keepdim=True)
+        if num_objectives > 1:
+            centered_singular_values = torch.linalg.svdvals(centered_grads)
+            pca_variance = torch.square(centered_singular_values)
+            pca_total_variance = pca_variance.sum().clamp_min(1.0e-8)
+            pca_ratios = pca_variance / pca_total_variance
+        else:
+            pca_ratios = torch.ones(1, device=grads.device)
+
+        def get_ratio(values: torch.Tensor, index: int) -> float:
+            if index < values.numel():
+                return values[index].item()
+            return 0.0
+
+        return {
+            "objective_effective_rank": effective_rank,
+            "objective_sv1_ratio": get_ratio(singular_ratios, 0),
+            "objective_sv2_ratio": get_ratio(singular_ratios, 1),
+            "objective_sv3_ratio": get_ratio(singular_ratios, 2),
+            "objective_pca_var1": get_ratio(pca_ratios, 0),
+            "objective_pca_var2": get_ratio(pca_ratios, 1),
+            "objective_pca_var3": get_ratio(pca_ratios, 2),
+        }
     '''
     def _flatten_grad_list(
         self, grads: Sequence[torch.Tensor | None], params: Sequence[torch.nn.Parameter]
@@ -436,6 +619,57 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_kl_divergence = 0
+        mean_objective_mean_cosine = 0
+        mean_objective_median_cosine = 0
+        mean_objective_min_cosine = 0
+        mean_objective_max_cosine = 0
+        mean_objective_std_cosine = 0
+        mean_objective_conflict_fraction = 0
+        mean_objective_effective_rank = 0
+        mean_objective_sv1_ratio = 0
+        mean_objective_sv2_ratio = 0
+        mean_objective_sv3_ratio = 0
+        mean_objective_pca_var1 = 0
+        mean_objective_pca_var2 = 0
+        mean_objective_pca_var3 = 0
+        mean_aligned_grad_norm = 0
+        mean_regularizer_grad_norm = 0
+        mean_reg_scale = 0
+        mean_scaled_regularizer_grad_norm = 0
+        mean_total_actor_grad_norm = 0
+        mean_actor_mean_grad_norm = 0
+        mean_actor_std_grad_norm = 0
+        mean_actor_std_to_mean_grad_ratio = 0
+        mean_num_aligned_terms = 0
+        mean_num_regularizer_terms = 0
+        mean_ppo_per_objective_proxy_grad_norm = 0
+        mean_amtl_actor_grad_norm = 0
+        mean_blended_actor_grad_norm = 0
+        mean_ppo_per_objective_proxy_amtl_grad_cosine = 0
+        mean_ppo_true_actor_grad_norm = 0
+        mean_ppo_true_amtl_grad_cosine = 0
+        mean_ppo_true_to_amtl_norm_ratio = 0
+        mean_ppo_true_minus_amtl_grad_norm = 0
+        mean_ppo_true_minus_amtl_relative_norm = 0
+        mean_amtl_projection_on_ppo_true = 0
+        mean_ppo_true_projection_on_amtl = 0
+        mean_ppo_true_actor_mean_grad_norm = 0
+        mean_ppo_true_actor_std_grad_norm = 0
+        mean_amtl_actor_mean_grad_norm = 0
+        mean_amtl_actor_std_grad_norm = 0
+        mean_ppo_true_std_to_mean_grad_ratio = 0
+        mean_amtl_std_to_mean_grad_ratio = 0
+        mean_top_objective_grad_fraction = 0
+        mean_bottom_objective_grad_fraction = 0
+        mean_objective_grad_fraction_entropy = 0
+        mean_logged_ppo_blend_weight = 0
+        mean_logged_amtl_blend_weight = 0
+        mean_objective_grad_norms: dict[str, float] = {}
+        mean_objective_grad_fractions: dict[str, float] = {}
+        mean_objective_aligned_projections: dict[str, float] = {}
+        objective_cosine_matrix_sum: torch.Tensor | None = None
+        objective_cosine_matrix_count = 0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -506,71 +740,59 @@ class PPO:
             sigma_batch = self.policy.action_std[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
 
+            with torch.inference_mode():
+                kl = torch.sum(
+                    torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
+                    + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
+                    / (2.0 * torch.square(sigma_batch))
+                    - 0.5,
+                    axis=-1,
+                )
+                kl_mean = torch.mean(kl)
+
+                # Reduce the KL divergence across all GPUs so the logged value matches scheduler inputs.
+                if self.is_multi_gpu:
+                    torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
+                    kl_mean /= self.gpu_world_size
+
             # Compute KL divergence and adapt the learning rate
             if self.desired_kl is not None and self.schedule == "adaptive":
-                with torch.inference_mode():
-                    kl = torch.sum(
-                        torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
-                        + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
-                        / (2.0 * torch.square(sigma_batch))
-                        - 0.5,
-                        axis=-1,
-                    )
-                    kl_mean = torch.mean(kl)
+                # Update the learning rate only on the main process
+                # TODO: Is this needed? If KL-divergence is the "same" across all GPUs,
+                #       then the learning rate should be the same across all GPUs.
+                if self.gpu_global_rank == 0:
+                    if kl_mean > self.desired_kl * 2.0:
+                        self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                    elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
-                    # Reduce the KL divergence across all GPUs
-                    if self.is_multi_gpu:
-                        torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
-                        kl_mean /= self.gpu_world_size
+                # Update the learning rate for all GPUs
+                if self.is_multi_gpu:
+                    lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                    torch.distributed.broadcast(lr_tensor, src=0)
+                    self.learning_rate = lr_tensor.item()
 
-                    # Update the learning rate only on the main process
-                    # TODO: Is this needed? If KL-divergence is the "same" across all GPUs,
-                    #       then the learning rate should be the same across all GPUs.
-                    if self.gpu_global_rank == 0:
-                        if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-
-                    # Update the learning rate for all GPUs
-                    if self.is_multi_gpu:
-                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
-                        torch.distributed.broadcast(lr_tensor, src=0)
-                        self.learning_rate = lr_tensor.item()
-
-                    # Update the learning rate for all parameter groups
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                # Update the learning rate for all parameter groups
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = self.learning_rate
 
 
 
 
-            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
-            surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_loss = surrogate.mean()
-            surrogate_losses_by_term = None
-
-            if advantages_by_term_batch is not None:
-                surrogate_by_term = -advantages_by_term_batch * ratio.unsqueeze(-1)
-                surrogate_losses_by_term = surrogate_by_term.mean(dim=0)
-                surrogate_loss = surrogate_losses_by_term.mean()
-
-            value_loss = (returns_batch - value_batch).pow(2).mean()
-            auxiliary_loss = self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
-
-
-            '''
-            # Surrogate loss by term now that we have the option to do gradient surgery on each term separately
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            # g_ppo_true diagnostics must use the untouched scalar PPO actor loss:
+            # - scalar_advantage source tensor: advantages_batch
+            # - ratio source tensor: ratio
+            # - clipped_ratio source tensor: torch.clamp(ratio, 1-clip, 1+clip)
+            # - advantages_by_term_batch is intentionally not used here
+            scalar_surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            surrogate_loss = scalar_surrogate_loss
             surrogate_losses_by_term = None
-        
-            
-            #for ppo
+
             if advantages_by_term_batch is not None:
                 ratio_by_term = ratio.unsqueeze(-1)
                 clipped_ratio_by_term = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param).unsqueeze(-1)
@@ -578,22 +800,19 @@ class PPO:
                 surrogate_clipped_by_term = -advantages_by_term_batch * clipped_ratio_by_term
                 surrogate_losses_by_term = torch.max(surrogate_by_term, surrogate_clipped_by_term).mean(dim=0)
                 surrogate_loss = surrogate_losses_by_term.mean()
-                #print("advantages_by_term_batch:", advantages_by_term_batch.shape)
-           '''
-
 
             # Value function loss
-            # if self.use_clipped_value_loss:
-            #     value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
-            #         -self.clip_param, self.clip_param
-            #     )
-            #     value_losses = (value_batch - returns_batch).pow(2)
-            #     value_losses_clipped = (value_clipped - returns_batch).pow(2)
-            #     value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            # else:
-            #     value_loss = (returns_batch - value_batch).pow(2).mean()
+            if self.use_clipped_value_loss:
+                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                    -self.clip_param, self.clip_param
+                )
+                value_losses = (value_batch - returns_batch).pow(2)
+                value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                value_loss = torch.max(value_losses, value_losses_clipped).mean()
+            else:
+                value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            # auxiliary_loss = self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            auxiliary_loss = self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             # Symmetry loss
             if self.symmetry:
@@ -645,6 +864,55 @@ class PPO:
 
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
+            aligned_grad_norm_value = 0.0
+            regularizer_grad_norm_value = 0.0
+            reg_scale_value = 0.0
+            scaled_regularizer_grad_norm_value = 0.0
+            total_actor_grad_norm_value = 0.0
+            actor_mean_grad_norm_value = 0.0
+            actor_std_grad_norm_value = 0.0
+            actor_std_to_mean_grad_ratio_value = 0.0
+            num_aligned_terms_value = 0.0
+            num_regularizer_terms_value = 0.0
+            objective_mean_cosine_value = 0.0
+            objective_median_cosine_value = 0.0
+            objective_min_cosine_value = 0.0
+            objective_max_cosine_value = 0.0
+            objective_std_cosine_value = 0.0
+            objective_conflict_fraction_value = 0.0
+            objective_effective_rank_value = 0.0
+            objective_sv1_ratio_value = 0.0
+            objective_sv2_ratio_value = 0.0
+            objective_sv3_ratio_value = 0.0
+            objective_pca_var1_value = 0.0
+            objective_pca_var2_value = 0.0
+            objective_pca_var3_value = 0.0
+            ppo_actor_grad_norm_value = 0.0
+            ppo_true_actor_grad_norm_value = 0.0
+            amtl_actor_grad_norm_value = 0.0
+            blended_actor_grad_norm_value = 0.0
+            ppo_amtl_grad_cosine_value = 0.0
+            ppo_true_amtl_grad_cosine_value = 0.0
+            ppo_true_to_amtl_norm_ratio_value = 0.0
+            ppo_true_minus_amtl_grad_norm_value = 0.0
+            ppo_true_minus_amtl_relative_norm_value = 0.0
+            amtl_projection_on_ppo_true_value = 0.0
+            ppo_true_projection_on_amtl_value = 0.0
+            ppo_true_actor_mean_grad_norm_value = 0.0
+            ppo_true_actor_std_grad_norm_value = 0.0
+            amtl_actor_mean_grad_norm_value = 0.0
+            amtl_actor_std_grad_norm_value = 0.0
+            ppo_true_std_to_mean_grad_ratio_value = 0.0
+            amtl_std_to_mean_grad_ratio_value = 0.0
+            top_objective_grad_fraction_value = 0.0
+            bottom_objective_grad_fraction_value = 0.0
+            objective_grad_fraction_entropy_value = 0.0
+            aligned_objective_names: list[str] = []
+            regularizer_names: list[str] = []
+            raw_objective_grad_norms: dict[str, float] = {}
+            raw_objective_grad_fractions: dict[str, float] = {}
+            ppo_blend_weight_value = 1.0
+            amtl_blend_weight_value = 0.0
 
 
 
@@ -654,10 +922,37 @@ class PPO:
 
             if surrogate_losses_by_term is not None:
                 hybrid_term_indices = self._get_hybrid_term_indices()
+                reward_term_names = self._get_reward_term_names()
                 params = list(self.policy.parameters())
+                self._zero_existing_grads(params)
+                scalar_surrogate_loss.backward(retain_graph=True)
+                ppo_true_actor_grad = self._collect_flat_grad(params)
+                self._zero_existing_grads(params)
+                ppo_true_actor_grad_norm_value = ppo_true_actor_grad.norm().item()
+                self._zero_existing_grads(params)
+                surrogate_loss.backward(retain_graph=True)
+                ppo_actor_grad = self._collect_flat_grad(params)
+                self._zero_existing_grads(params)
+                ppo_actor_grad_norm_value = ppo_actor_grad.norm().item()
+                ppo_true_actor_mean_grad_norm_value = self._compute_flat_subset_grad_norm(
+                    params, ppo_true_actor_grad, self.policy.get_actor_mean_parameters()
+                )
+                ppo_true_actor_std_grad_norm_value = self._compute_flat_subset_grad_norm(
+                    params, ppo_true_actor_grad, self.policy.get_actor_std_parameters()
+                )
+                ppo_true_std_to_mean_grad_ratio_value = (
+                    ppo_true_actor_std_grad_norm_value / (ppo_true_actor_mean_grad_norm_value + 1.0e-8)
+                )
+                aligned_objective_names: list[str] = []
+                regularizer_names: list[str] = []
+                raw_objective_grad_norms: dict[str, float] = {}
+                raw_objective_grad_fractions: dict[str, float] = {}
 
                 if hybrid_term_indices is None:
                     grads = []
+                    num_aligned_terms_value = float(len(surrogate_losses_by_term))
+                    if reward_term_names is not None:
+                        aligned_objective_names = reward_term_names[: len(surrogate_losses_by_term)]
                     for loss in surrogate_losses_by_term:
                         self._zero_existing_grads(params)
                         loss.backward(retain_graph=True)
@@ -665,11 +960,114 @@ class PPO:
 
                     self._zero_existing_grads(params)
                     grads = torch.stack(grads, dim=0)
+                    grad_norms = grads.norm(dim=1)
+                    grad_fractions = grad_norms / grad_norms.sum().clamp_min(1.0e-8)
+                    if aligned_objective_names:
+                        raw_objective_grad_norms = {
+                            name: value.item() for name, value in zip(aligned_objective_names, grad_norms, strict=True)
+                        }
+                        raw_objective_grad_fractions = {
+                            name: value.item()
+                            for name, value in zip(aligned_objective_names, grad_fractions, strict=True)
+                        }
+                    objective_cosine_stats, objective_cosine_matrix = self._compute_objective_cosine_stats(grads)
+                    objective_matrix_stats = self._compute_objective_matrix_stats(grads)
+                    objective_fraction_summary = self._compute_objective_fraction_summary(grads)
+                    objective_mean_cosine_value = objective_cosine_stats["objective_mean_cosine"]
+                    objective_median_cosine_value = objective_cosine_stats["objective_median_cosine"]
+                    objective_min_cosine_value = objective_cosine_stats["objective_min_cosine"]
+                    objective_max_cosine_value = objective_cosine_stats["objective_max_cosine"]
+                    objective_std_cosine_value = objective_cosine_stats["objective_std_cosine"]
+                    objective_conflict_fraction_value = objective_cosine_stats["objective_conflict_fraction"]
+                    objective_effective_rank_value = objective_matrix_stats["objective_effective_rank"]
+                    objective_sv1_ratio_value = objective_matrix_stats["objective_sv1_ratio"]
+                    objective_sv2_ratio_value = objective_matrix_stats["objective_sv2_ratio"]
+                    objective_sv3_ratio_value = objective_matrix_stats["objective_sv3_ratio"]
+                    objective_pca_var1_value = objective_matrix_stats["objective_pca_var1"]
+                    objective_pca_var2_value = objective_matrix_stats["objective_pca_var2"]
+                    objective_pca_var3_value = objective_matrix_stats["objective_pca_var3"]
+                    top_objective_grad_fraction_value = objective_fraction_summary["top_objective_grad_fraction"]
+                    bottom_objective_grad_fraction_value = objective_fraction_summary["bottom_objective_grad_fraction"]
+                    objective_grad_fraction_entropy_value = objective_fraction_summary["objective_grad_fraction_entropy"]
+                    objective_cosine_matrix_sum = (
+                        objective_cosine_matrix.clone()
+                        if objective_cosine_matrix_sum is None
+                        else objective_cosine_matrix_sum + objective_cosine_matrix
+                    )
+                    objective_cosine_matrix_count += 1
+                    original_grads = grads
                     grads, weights, singulars = ProcrustesSolver.apply(grads.T.unsqueeze(0))
                     grad = grads[0].sum(-1)
-                    set_shared_grad(params, grad)
+                    if reward_term_names is not None:
+                        objective_names = reward_term_names[: len(surrogate_losses_by_term)]
+                        self._accumulate_objective_gradient_metrics(
+                            mean_objective_grad_norms,
+                            mean_objective_grad_fractions,
+                            mean_objective_aligned_projections,
+                            objective_names,
+                            original_grads,
+                            aligned_grad=grad,
+                        )
+                    amtl_actor_grad = grad
+                    aligned_grad_norm_value = amtl_actor_grad.norm().item()
+                    amtl_actor_grad_norm_value = aligned_grad_norm_value
+                    amtl_actor_mean_grad_norm_value = self._compute_flat_subset_grad_norm(
+                        params, amtl_actor_grad, self.policy.get_actor_mean_parameters()
+                    )
+                    amtl_actor_std_grad_norm_value = self._compute_flat_subset_grad_norm(
+                        params, amtl_actor_grad, self.policy.get_actor_std_parameters()
+                    )
+                    amtl_std_to_mean_grad_ratio_value = (
+                        amtl_actor_std_grad_norm_value / (amtl_actor_mean_grad_norm_value + 1.0e-8)
+                    )
+                    effective_ppo_blend_weight, effective_amtl_blend_weight = self._get_effective_blend_weights()
+                    if self.use_blended_actor_update:
+                        ppo_blend_grad = ppo_true_actor_grad
+                        ppo_blend_grad_norm = ppo_true_actor_grad.norm()
+                        amtl_actor_grad_norm = amtl_actor_grad.norm()
+                        ppo_blend_grad_normed = ppo_blend_grad / (ppo_blend_grad_norm + 1.0e-8)
+                        amtl_actor_grad_normed = amtl_actor_grad / (amtl_actor_grad_norm + 1.0e-8)
+                        blended_actor_grad = (
+                            effective_ppo_blend_weight * ppo_blend_grad_normed
+                            + effective_amtl_blend_weight * amtl_actor_grad_normed
+                        ) * ppo_blend_grad_norm
+                        ppo_blend_weight_value = effective_ppo_blend_weight
+                        amtl_blend_weight_value = effective_amtl_blend_weight
+                    else:
+                        blended_actor_grad = amtl_actor_grad
+                        ppo_blend_weight_value = 0.0
+                        amtl_blend_weight_value = 1.0
+                    blended_actor_grad_norm_value = blended_actor_grad.norm().item()
+                    total_actor_grad_norm_value = blended_actor_grad_norm_value
+                    if ppo_actor_grad_norm_value > 0.0 and amtl_actor_grad_norm_value > 0.0:
+                        ppo_amtl_grad_cosine_value = torch.dot(ppo_actor_grad, amtl_actor_grad).item() / (
+                            ppo_actor_grad_norm_value * amtl_actor_grad_norm_value + 1.0e-8
+                        )
+                    if ppo_true_actor_grad_norm_value > 0.0 and amtl_actor_grad_norm_value > 0.0:
+                        ppo_true_amtl_grad_cosine_value = torch.dot(ppo_true_actor_grad, amtl_actor_grad).item() / (
+                            ppo_true_actor_grad_norm_value * amtl_actor_grad_norm_value + 1.0e-8
+                        )
+                        ppo_true_to_amtl_norm_ratio_value = (
+                            ppo_true_actor_grad_norm_value / (amtl_actor_grad_norm_value + 1.0e-8)
+                        )
+                        ppo_true_minus_amtl_grad_norm_value = (ppo_true_actor_grad - amtl_actor_grad).norm().item()
+                        ppo_true_minus_amtl_relative_norm_value = (
+                            ppo_true_minus_amtl_grad_norm_value / (ppo_true_actor_grad_norm_value + 1.0e-8)
+                        )
+                        amtl_projection_on_ppo_true_value = torch.dot(
+                            amtl_actor_grad, ppo_true_actor_grad / (ppo_true_actor_grad_norm_value + 1.0e-8)
+                        ).item()
+                        ppo_true_projection_on_amtl_value = torch.dot(
+                            ppo_true_actor_grad, amtl_actor_grad / (amtl_actor_grad_norm_value + 1.0e-8)
+                        ).item()
+                    set_shared_grad(params, blended_actor_grad)
                 else:
                     motion_indices, regularizer_indices = hybrid_term_indices
+                    num_aligned_terms_value = float(len(motion_indices))
+                    num_regularizer_terms_value = float(len(regularizer_indices))
+                    if reward_term_names is not None:
+                        aligned_objective_names = [reward_term_names[idx] for idx in motion_indices]
+                        regularizer_names = [reward_term_names[idx] for idx in regularizer_indices]
 
                     motion_grads = []
                     for idx in motion_indices:
@@ -679,22 +1077,224 @@ class PPO:
 
                     self._zero_existing_grads(params)
                     motion_grads = torch.stack(motion_grads, dim=0)
+                    motion_grad_norms = motion_grads.norm(dim=1)
+                    motion_grad_fractions = motion_grad_norms / motion_grad_norms.sum().clamp_min(1.0e-8)
+                    if aligned_objective_names:
+                        raw_objective_grad_norms = {
+                            name: value.item()
+                            for name, value in zip(aligned_objective_names, motion_grad_norms, strict=True)
+                        }
+                        raw_objective_grad_fractions = {
+                            name: value.item()
+                            for name, value in zip(aligned_objective_names, motion_grad_fractions, strict=True)
+                        }
+                    objective_cosine_stats, objective_cosine_matrix = self._compute_objective_cosine_stats(motion_grads)
+                    objective_matrix_stats = self._compute_objective_matrix_stats(motion_grads)
+                    objective_fraction_summary = self._compute_objective_fraction_summary(motion_grads)
+                    objective_mean_cosine_value = objective_cosine_stats["objective_mean_cosine"]
+                    objective_median_cosine_value = objective_cosine_stats["objective_median_cosine"]
+                    objective_min_cosine_value = objective_cosine_stats["objective_min_cosine"]
+                    objective_max_cosine_value = objective_cosine_stats["objective_max_cosine"]
+                    objective_std_cosine_value = objective_cosine_stats["objective_std_cosine"]
+                    objective_conflict_fraction_value = objective_cosine_stats["objective_conflict_fraction"]
+                    objective_effective_rank_value = objective_matrix_stats["objective_effective_rank"]
+                    objective_sv1_ratio_value = objective_matrix_stats["objective_sv1_ratio"]
+                    objective_sv2_ratio_value = objective_matrix_stats["objective_sv2_ratio"]
+                    objective_sv3_ratio_value = objective_matrix_stats["objective_sv3_ratio"]
+                    objective_pca_var1_value = objective_matrix_stats["objective_pca_var1"]
+                    objective_pca_var2_value = objective_matrix_stats["objective_pca_var2"]
+                    objective_pca_var3_value = objective_matrix_stats["objective_pca_var3"]
+                    top_objective_grad_fraction_value = objective_fraction_summary["top_objective_grad_fraction"]
+                    bottom_objective_grad_fraction_value = objective_fraction_summary["bottom_objective_grad_fraction"]
+                    objective_grad_fraction_entropy_value = objective_fraction_summary["objective_grad_fraction_entropy"]
+                    objective_cosine_matrix_sum = (
+                        objective_cosine_matrix.clone()
+                        if objective_cosine_matrix_sum is None
+                        else objective_cosine_matrix_sum + objective_cosine_matrix
+                    )
+                    objective_cosine_matrix_count += 1
                     aligned_motion_grads, weights, singulars = ProcrustesSolver.apply(
                         motion_grads.T.unsqueeze(0)
                     )
                     aligned_motion_grad = aligned_motion_grads[0].sum(-1)
+                    if reward_term_names is not None:
+                        motion_objective_names = [reward_term_names[idx] for idx in motion_indices]
+                        self._accumulate_objective_gradient_metrics(
+                            mean_objective_grad_norms,
+                            mean_objective_grad_fractions,
+                            mean_objective_aligned_projections,
+                            motion_objective_names,
+                            motion_grads,
+                            aligned_motion_grad,
+                        )
 
                     regularizer_loss = surrogate_losses_by_term[regularizer_indices].sum()
+                    self._zero_existing_grads(params)
                     regularizer_loss.backward(retain_graph=True)
                     regularizer_grad = self._collect_flat_grad(params)
 
+                    motion_grad_norm = aligned_motion_grad.norm()
+                    regularizer_grad_norm = regularizer_grad.norm()
+                    reg_scale = self.beta_reg * (
+                        motion_grad_norm / (regularizer_grad_norm + 1.0e-8)
+                    )
+                    reg_scale = torch.clamp(reg_scale, max=self.max_reg_scale)
+                    scaled_regularizer_grad = reg_scale * regularizer_grad
+
                     self._zero_existing_grads(params)
-                    total_actor_grad = aligned_motion_grad + regularizer_grad
-                    set_shared_grad(params, total_actor_grad)
+                    amtl_actor_grad = aligned_motion_grad + scaled_regularizer_grad
+                    aligned_grad_norm_value = motion_grad_norm.item()
+                    amtl_actor_grad_norm_value = amtl_actor_grad.norm().item()
+                    amtl_actor_mean_grad_norm_value = self._compute_flat_subset_grad_norm(
+                        params, amtl_actor_grad, self.policy.get_actor_mean_parameters()
+                    )
+                    amtl_actor_std_grad_norm_value = self._compute_flat_subset_grad_norm(
+                        params, amtl_actor_grad, self.policy.get_actor_std_parameters()
+                    )
+                    amtl_std_to_mean_grad_ratio_value = (
+                        amtl_actor_std_grad_norm_value / (amtl_actor_mean_grad_norm_value + 1.0e-8)
+                    )
+                    regularizer_grad_norm_value = regularizer_grad_norm.item()
+                    reg_scale_value = reg_scale.item()
+                    scaled_regularizer_grad_norm_value = scaled_regularizer_grad.norm().item()
+                    effective_ppo_blend_weight, effective_amtl_blend_weight = self._get_effective_blend_weights()
+                    if self.use_blended_actor_update:
+                        ppo_blend_grad = ppo_true_actor_grad
+                        ppo_blend_grad_norm = ppo_true_actor_grad.norm()
+                        amtl_actor_grad_norm = amtl_actor_grad.norm()
+                        ppo_blend_grad_normed = ppo_blend_grad / (ppo_blend_grad_norm + 1.0e-8)
+                        amtl_actor_grad_normed = amtl_actor_grad / (amtl_actor_grad_norm + 1.0e-8)
+                        blended_actor_grad = (
+                            effective_ppo_blend_weight * ppo_blend_grad_normed
+                            + effective_amtl_blend_weight * amtl_actor_grad_normed
+                        ) * ppo_blend_grad_norm
+                        ppo_blend_weight_value = effective_ppo_blend_weight
+                        amtl_blend_weight_value = effective_amtl_blend_weight
+                    else:
+                        blended_actor_grad = amtl_actor_grad
+                        ppo_blend_weight_value = 0.0
+                        amtl_blend_weight_value = 1.0
+                    blended_actor_grad_norm_value = blended_actor_grad.norm().item()
+                    total_actor_grad_norm_value = blended_actor_grad_norm_value
+                    if ppo_actor_grad_norm_value > 0.0 and amtl_actor_grad_norm_value > 0.0:
+                        ppo_amtl_grad_cosine_value = torch.dot(ppo_actor_grad, amtl_actor_grad).item() / (
+                            ppo_actor_grad_norm_value * amtl_actor_grad_norm_value + 1.0e-8
+                        )
+                    if ppo_true_actor_grad_norm_value > 0.0 and amtl_actor_grad_norm_value > 0.0:
+                        ppo_true_amtl_grad_cosine_value = torch.dot(ppo_true_actor_grad, amtl_actor_grad).item() / (
+                            ppo_true_actor_grad_norm_value * amtl_actor_grad_norm_value + 1.0e-8
+                        )
+                        ppo_true_to_amtl_norm_ratio_value = (
+                            ppo_true_actor_grad_norm_value / (amtl_actor_grad_norm_value + 1.0e-8)
+                        )
+                        ppo_true_minus_amtl_grad_norm_value = (ppo_true_actor_grad - amtl_actor_grad).norm().item()
+                        ppo_true_minus_amtl_relative_norm_value = (
+                            ppo_true_minus_amtl_grad_norm_value / (ppo_true_actor_grad_norm_value + 1.0e-8)
+                        )
+                        amtl_projection_on_ppo_true_value = torch.dot(
+                            amtl_actor_grad, ppo_true_actor_grad / (ppo_true_actor_grad_norm_value + 1.0e-8)
+                        ).item()
+                        ppo_true_projection_on_amtl_value = torch.dot(
+                            ppo_true_actor_grad, amtl_actor_grad / (amtl_actor_grad_norm_value + 1.0e-8)
+                        ).item()
+                    set_shared_grad(params, blended_actor_grad)
 
                 auxiliary_loss.backward()
             else:
-                (surrogate_loss + auxiliary_loss).backward()
+                params = list(self.policy.parameters())
+                self._zero_existing_grads(params)
+                scalar_surrogate_loss.backward(retain_graph=True)
+                ppo_true_actor_grad = self._collect_flat_grad(params)
+                self._zero_existing_grads(params)
+                ppo_true_actor_grad_norm_value = ppo_true_actor_grad.norm().item()
+                self._zero_existing_grads(params)
+                surrogate_loss.backward(retain_graph=True)
+                ppo_actor_grad = self._collect_flat_grad(params)
+                self._zero_existing_grads(params)
+                ppo_actor_grad_norm_value = ppo_actor_grad.norm().item()
+                amtl_actor_grad_norm_value = ppo_actor_grad_norm_value
+                ppo_true_actor_mean_grad_norm_value = self._compute_flat_subset_grad_norm(
+                    params, ppo_true_actor_grad, self.policy.get_actor_mean_parameters()
+                )
+                ppo_true_actor_std_grad_norm_value = self._compute_flat_subset_grad_norm(
+                    params, ppo_true_actor_grad, self.policy.get_actor_std_parameters()
+                )
+                ppo_true_std_to_mean_grad_ratio_value = (
+                    ppo_true_actor_std_grad_norm_value / (ppo_true_actor_mean_grad_norm_value + 1.0e-8)
+                )
+                amtl_actor_mean_grad_norm_value = ppo_true_actor_mean_grad_norm_value
+                amtl_actor_std_grad_norm_value = ppo_true_actor_std_grad_norm_value
+                amtl_std_to_mean_grad_ratio_value = ppo_true_std_to_mean_grad_ratio_value
+                blended_actor_grad_norm_value = ppo_actor_grad_norm_value
+                total_actor_grad_norm_value = blended_actor_grad_norm_value
+                ppo_amtl_grad_cosine_value = 1.0 if ppo_actor_grad_norm_value > 0.0 else 0.0
+                ppo_true_amtl_grad_cosine_value = 1.0 if ppo_true_actor_grad_norm_value > 0.0 else 0.0
+                ppo_true_to_amtl_norm_ratio_value = 1.0 if ppo_true_actor_grad_norm_value > 0.0 else 0.0
+                ppo_true_minus_amtl_grad_norm_value = 0.0
+                ppo_true_minus_amtl_relative_norm_value = 0.0
+                amtl_projection_on_ppo_true_value = ppo_true_actor_grad_norm_value
+                ppo_true_projection_on_amtl_value = ppo_true_actor_grad_norm_value
+                ppo_blend_weight_value = 1.0
+                amtl_blend_weight_value = 0.0
+                set_shared_grad(params, ppo_true_actor_grad)
+                auxiliary_loss.backward()
+
+            if not self._gradient_debug_dump_written and self.update_counter == 0:
+                debug_payload = {
+                    "g_ppo_true_norm": ppo_true_actor_grad_norm_value,
+                    "g_amtl_norm": amtl_actor_grad_norm_value,
+                    "cosine": ppo_true_amtl_grad_cosine_value,
+                    "norm_ratio": ppo_true_to_amtl_norm_ratio_value,
+                    "relative_difference_norm": ppo_true_minus_amtl_relative_norm_value,
+                    "ppo_true_minus_amtl_grad_norm": ppo_true_minus_amtl_grad_norm_value,
+                    "first_10_g_ppo_true": ppo_true_actor_grad[:10].detach().cpu().tolist(),
+                    "first_10_g_amtl": (
+                        amtl_actor_grad[:10].detach().cpu().tolist()
+                        if surrogate_losses_by_term is not None
+                        else ppo_true_actor_grad[:10].detach().cpu().tolist()
+                    ),
+                    "aligned_objective_names": aligned_objective_names if "aligned_objective_names" in locals() else [],
+                    "regularizer_names": regularizer_names if "regularizer_names" in locals() else [],
+                    "num_aligned_terms": num_aligned_terms_value,
+                    "num_regularizer_terms": num_regularizer_terms_value,
+                    "raw_per_objective_gradient_norms": raw_objective_grad_norms if "raw_objective_grad_norms" in locals() else {},
+                    "raw_per_objective_gradient_fractions": (
+                        raw_objective_grad_fractions if "raw_objective_grad_fractions" in locals() else {}
+                    ),
+                    "g_ppo_true_checks": {
+                        "advantage_source_tensor": "advantages_batch",
+                        "ratio_source_tensor": "ratio",
+                        "clipped_ratio_source_tensor": "torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)",
+                        "uses_advantages_by_term": False,
+                    },
+                    "g_amtl_checks": {
+                        "definition": "aligned objective gradient + reg_scale * regularizer_gradient",
+                        "regularizer_scaling_uses_beta_reg": True,
+                        "regularizer_scaling_uses_max_reg_scale": True,
+                    },
+                    "gradient_isolation_checks": {
+                        "same_tensor_object": (
+                            False if surrogate_losses_by_term is None else ppo_true_actor_grad.data_ptr() == amtl_actor_grad.data_ptr()
+                        ),
+                        "same_shape": (
+                            True if surrogate_losses_by_term is None else list(ppo_true_actor_grad.shape) == list(amtl_actor_grad.shape)
+                        ),
+                        "ppo_true_has_nan_or_inf": not torch.isfinite(ppo_true_actor_grad).all().item(),
+                        "amtl_has_nan_or_inf": (
+                            False if surrogate_losses_by_term is None else not torch.isfinite(amtl_actor_grad).all().item()
+                        ),
+                        "ppo_true_nonzero_norm": ppo_true_actor_grad_norm_value > 0.0,
+                        "amtl_nonzero_norm": amtl_actor_grad_norm_value > 0.0,
+                        "includes_value_loss": False,
+                        "includes_entropy_loss": False,
+                        "includes_auxiliary_loss": False,
+                    },
+                }
+                self._write_first_update_gradient_debug(debug_payload)
+
+            actor_mean_grad_norm_value = self._compute_parameter_grad_norm(self.policy.get_actor_mean_parameters())
+            actor_std_grad_norm_value = self._compute_parameter_grad_norm(self.policy.get_actor_std_parameters())
+            actor_std_to_mean_grad_ratio_value = actor_std_grad_norm_value / (actor_mean_grad_norm_value + 1.0e-8)
 
             # self.optimizer.step()
 
@@ -779,6 +1379,52 @@ class PPO:
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
+            mean_kl_divergence += kl_mean.item()
+            mean_objective_mean_cosine += objective_mean_cosine_value
+            mean_objective_median_cosine += objective_median_cosine_value
+            mean_objective_min_cosine += objective_min_cosine_value
+            mean_objective_max_cosine += objective_max_cosine_value
+            mean_objective_std_cosine += objective_std_cosine_value
+            mean_objective_conflict_fraction += objective_conflict_fraction_value
+            mean_objective_effective_rank += objective_effective_rank_value
+            mean_objective_sv1_ratio += objective_sv1_ratio_value
+            mean_objective_sv2_ratio += objective_sv2_ratio_value
+            mean_objective_sv3_ratio += objective_sv3_ratio_value
+            mean_objective_pca_var1 += objective_pca_var1_value
+            mean_objective_pca_var2 += objective_pca_var2_value
+            mean_objective_pca_var3 += objective_pca_var3_value
+            mean_aligned_grad_norm += aligned_grad_norm_value
+            mean_regularizer_grad_norm += regularizer_grad_norm_value
+            mean_reg_scale += reg_scale_value
+            mean_scaled_regularizer_grad_norm += scaled_regularizer_grad_norm_value
+            mean_total_actor_grad_norm += total_actor_grad_norm_value
+            mean_actor_mean_grad_norm += actor_mean_grad_norm_value
+            mean_actor_std_grad_norm += actor_std_grad_norm_value
+            mean_actor_std_to_mean_grad_ratio += actor_std_to_mean_grad_ratio_value
+            mean_num_aligned_terms += num_aligned_terms_value
+            mean_num_regularizer_terms += num_regularizer_terms_value
+            mean_ppo_per_objective_proxy_grad_norm += ppo_actor_grad_norm_value
+            mean_ppo_true_actor_grad_norm += ppo_true_actor_grad_norm_value
+            mean_amtl_actor_grad_norm += amtl_actor_grad_norm_value
+            mean_blended_actor_grad_norm += blended_actor_grad_norm_value
+            mean_ppo_per_objective_proxy_amtl_grad_cosine += ppo_amtl_grad_cosine_value
+            mean_ppo_true_amtl_grad_cosine += ppo_true_amtl_grad_cosine_value
+            mean_ppo_true_to_amtl_norm_ratio += ppo_true_to_amtl_norm_ratio_value
+            mean_ppo_true_minus_amtl_grad_norm += ppo_true_minus_amtl_grad_norm_value
+            mean_ppo_true_minus_amtl_relative_norm += ppo_true_minus_amtl_relative_norm_value
+            mean_amtl_projection_on_ppo_true += amtl_projection_on_ppo_true_value
+            mean_ppo_true_projection_on_amtl += ppo_true_projection_on_amtl_value
+            mean_ppo_true_actor_mean_grad_norm += ppo_true_actor_mean_grad_norm_value
+            mean_ppo_true_actor_std_grad_norm += ppo_true_actor_std_grad_norm_value
+            mean_amtl_actor_mean_grad_norm += amtl_actor_mean_grad_norm_value
+            mean_amtl_actor_std_grad_norm += amtl_actor_std_grad_norm_value
+            mean_ppo_true_std_to_mean_grad_ratio += ppo_true_std_to_mean_grad_ratio_value
+            mean_amtl_std_to_mean_grad_ratio += amtl_std_to_mean_grad_ratio_value
+            mean_top_objective_grad_fraction += top_objective_grad_fraction_value
+            mean_bottom_objective_grad_fraction += bottom_objective_grad_fraction_value
+            mean_objective_grad_fraction_entropy += objective_grad_fraction_entropy_value
+            mean_logged_ppo_blend_weight += ppo_blend_weight_value
+            mean_logged_amtl_blend_weight += amtl_blend_weight_value
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -791,6 +1437,63 @@ class PPO:
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_kl_divergence /= num_updates
+        mean_objective_mean_cosine /= num_updates
+        mean_objective_median_cosine /= num_updates
+        mean_objective_min_cosine /= num_updates
+        mean_objective_max_cosine /= num_updates
+        mean_objective_std_cosine /= num_updates
+        mean_objective_conflict_fraction /= num_updates
+        mean_objective_effective_rank /= num_updates
+        mean_objective_sv1_ratio /= num_updates
+        mean_objective_sv2_ratio /= num_updates
+        mean_objective_sv3_ratio /= num_updates
+        mean_objective_pca_var1 /= num_updates
+        mean_objective_pca_var2 /= num_updates
+        mean_objective_pca_var3 /= num_updates
+        mean_aligned_grad_norm /= num_updates
+        mean_regularizer_grad_norm /= num_updates
+        mean_reg_scale /= num_updates
+        mean_scaled_regularizer_grad_norm /= num_updates
+        mean_total_actor_grad_norm /= num_updates
+        mean_actor_mean_grad_norm /= num_updates
+        mean_actor_std_grad_norm /= num_updates
+        mean_actor_std_to_mean_grad_ratio /= num_updates
+        mean_num_aligned_terms /= num_updates
+        mean_num_regularizer_terms /= num_updates
+        mean_ppo_per_objective_proxy_grad_norm /= num_updates
+        mean_ppo_true_actor_grad_norm /= num_updates
+        mean_amtl_actor_grad_norm /= num_updates
+        mean_blended_actor_grad_norm /= num_updates
+        mean_ppo_per_objective_proxy_amtl_grad_cosine /= num_updates
+        mean_ppo_true_amtl_grad_cosine /= num_updates
+        mean_ppo_true_to_amtl_norm_ratio /= num_updates
+        mean_ppo_true_minus_amtl_grad_norm /= num_updates
+        mean_ppo_true_minus_amtl_relative_norm /= num_updates
+        mean_amtl_projection_on_ppo_true /= num_updates
+        mean_ppo_true_projection_on_amtl /= num_updates
+        mean_ppo_true_actor_mean_grad_norm /= num_updates
+        mean_ppo_true_actor_std_grad_norm /= num_updates
+        mean_amtl_actor_mean_grad_norm /= num_updates
+        mean_amtl_actor_std_grad_norm /= num_updates
+        mean_ppo_true_std_to_mean_grad_ratio /= num_updates
+        mean_amtl_std_to_mean_grad_ratio /= num_updates
+        mean_top_objective_grad_fraction /= num_updates
+        mean_bottom_objective_grad_fraction /= num_updates
+        mean_objective_grad_fraction_entropy /= num_updates
+        mean_logged_ppo_blend_weight /= num_updates
+        mean_logged_amtl_blend_weight /= num_updates
+        for objective_name in list(mean_objective_grad_norms):
+            mean_objective_grad_norms[objective_name] /= num_updates
+        for objective_name in list(mean_objective_grad_fractions):
+            mean_objective_grad_fractions[objective_name] /= num_updates
+        for objective_name in list(mean_objective_aligned_projections):
+            mean_objective_aligned_projections[objective_name] /= num_updates
+        self.latest_objective_cosine_matrix = None
+        if objective_cosine_matrix_sum is not None and objective_cosine_matrix_count > 0:
+            self.latest_objective_cosine_matrix = (
+                objective_cosine_matrix_sum / objective_cosine_matrix_count
+            ).detach().cpu()
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
@@ -804,12 +1507,66 @@ class PPO:
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
+            "kl_divergence": mean_kl_divergence,
+            "objective_mean_cosine": mean_objective_mean_cosine,
+            "objective_median_cosine": mean_objective_median_cosine,
+            "objective_min_cosine": mean_objective_min_cosine,
+            "objective_max_cosine": mean_objective_max_cosine,
+            "objective_std_cosine": mean_objective_std_cosine,
+            "objective_conflict_fraction": mean_objective_conflict_fraction,
+            "objective_effective_rank": mean_objective_effective_rank,
+            "objective_sv1_ratio": mean_objective_sv1_ratio,
+            "objective_sv2_ratio": mean_objective_sv2_ratio,
+            "objective_sv3_ratio": mean_objective_sv3_ratio,
+            "objective_pca_var1": mean_objective_pca_var1,
+            "objective_pca_var2": mean_objective_pca_var2,
+            "objective_pca_var3": mean_objective_pca_var3,
+            "aligned_grad_norm": mean_aligned_grad_norm,
+            "regularizer_grad_norm": mean_regularizer_grad_norm,
+            "reg_scale": mean_reg_scale,
+            "scaled_regularizer_grad_norm": mean_scaled_regularizer_grad_norm,
+            "total_actor_grad_norm": mean_total_actor_grad_norm,
+            "actor_mean_grad_norm": mean_actor_mean_grad_norm,
+            "actor_std_grad_norm": mean_actor_std_grad_norm,
+            "actor_std_to_mean_grad_ratio": mean_actor_std_to_mean_grad_ratio,
+            "num_aligned_terms": mean_num_aligned_terms,
+            "num_regularizer_terms": mean_num_regularizer_terms,
+            "ppo_per_objective_proxy_grad_norm": mean_ppo_per_objective_proxy_grad_norm,
+            "ppo_true_actor_grad_norm": mean_ppo_true_actor_grad_norm,
+            "amtl_actor_grad_norm": mean_amtl_actor_grad_norm,
+            "blended_actor_grad_norm": mean_blended_actor_grad_norm,
+            "ppo_per_objective_proxy_amtl_grad_cosine": mean_ppo_per_objective_proxy_amtl_grad_cosine,
+            "ppo_true_amtl_grad_cosine": mean_ppo_true_amtl_grad_cosine,
+            "ppo_true_to_amtl_norm_ratio": mean_ppo_true_to_amtl_norm_ratio,
+            "ppo_true_minus_amtl_grad_norm": mean_ppo_true_minus_amtl_grad_norm,
+            "ppo_true_minus_amtl_relative_norm": mean_ppo_true_minus_amtl_relative_norm,
+            "amtl_projection_on_ppo_true": mean_amtl_projection_on_ppo_true,
+            "ppo_true_projection_on_amtl": mean_ppo_true_projection_on_amtl,
+            "ppo_true_actor_mean_grad_norm": mean_ppo_true_actor_mean_grad_norm,
+            "ppo_true_actor_std_grad_norm": mean_ppo_true_actor_std_grad_norm,
+            "amtl_actor_mean_grad_norm": mean_amtl_actor_mean_grad_norm,
+            "amtl_actor_std_grad_norm": mean_amtl_actor_std_grad_norm,
+            "ppo_true_std_to_mean_grad_ratio": mean_ppo_true_std_to_mean_grad_ratio,
+            "amtl_std_to_mean_grad_ratio": mean_amtl_std_to_mean_grad_ratio,
+            "top_objective_grad_fraction": mean_top_objective_grad_fraction,
+            "bottom_objective_grad_fraction": mean_bottom_objective_grad_fraction,
+            "objective_grad_fraction_entropy": mean_objective_grad_fraction_entropy,
+            "ppo_blend_weight": mean_logged_ppo_blend_weight,
+            "amtl_blend_weight": mean_logged_amtl_blend_weight,
+            "blend_uses_ppo_true": 1.0,
         }
+        for objective_name, value in mean_objective_grad_norms.items():
+            loss_dict[f"objective_grad_norm/{objective_name}"] = value
+        for objective_name, value in mean_objective_grad_fractions.items():
+            loss_dict[f"objective_grad_fraction/{objective_name}"] = value
+        for objective_name, value in mean_objective_aligned_projections.items():
+            loss_dict[f"objective_aligned_projection/{objective_name}"] = value
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
 
+        self.update_counter += 1
         return loss_dict
 
     def broadcast_parameters(self) -> None:
