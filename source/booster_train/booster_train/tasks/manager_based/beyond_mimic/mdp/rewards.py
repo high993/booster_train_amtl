@@ -96,6 +96,50 @@ def motion_global_body_angular_velocity_error_exp(
     return torch.exp(-error / std**2)
 
 
+def _get_reference_contact_heuristics(
+    command: MotionCommand, body_names: list[str], height_margin: float, speed_threshold: float
+) -> dict[str, tuple[float, float]]:
+    cache_key = (tuple(body_names), float(height_margin), float(speed_threshold))
+    cache = getattr(command, "_reference_contact_heuristics_cache", {})
+    if cache_key not in cache:
+        heuristics: dict[str, tuple[float, float]] = {}
+        for body_name in body_names:
+            body_index = command.cfg.body_names.index(body_name)
+            foot_heights = command.motion.body_pos_w[:, body_index, 2]
+            height_threshold = float(torch.min(foot_heights).item() + height_margin)
+            heuristics[body_name] = (height_threshold, speed_threshold)
+        cache[cache_key] = heuristics
+        command._reference_contact_heuristics_cache = cache
+    return cache[cache_key]
+
+
+def motion_foot_contact_match(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    body_names: list[str],
+    height_margin: float = 0.035,
+    speed_threshold: float = 0.75,
+) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    heuristics = _get_reference_contact_heuristics(command, body_names, height_margin, speed_threshold)
+
+    contact_matches = []
+    for body_name, sensor_body_id in zip(body_names, sensor_cfg.body_ids, strict=True):
+        command_body_id = command.cfg.body_names.index(body_name)
+        foot_height = command.body_pos_w[:, command_body_id, 2]
+        foot_speed = torch.norm(command.body_lin_vel_w[:, command_body_id], dim=-1)
+        height_threshold, foot_speed_threshold = heuristics[body_name]
+        reference_contact = (foot_height <= height_threshold) & (foot_speed <= foot_speed_threshold)
+
+        net_force = contact_sensor.data.net_forces_w[:, sensor_body_id]
+        robot_contact = torch.norm(net_force, dim=-1) > contact_sensor.cfg.force_threshold
+        contact_matches.append((robot_contact == reference_contact).float())
+
+    return torch.stack(contact_matches, dim=1).mean(dim=1)
+
+
 def feet_stance_time(
         env: ManagerBasedRLEnv, asset_name: str, feet_names: list[str], vel_threshold: float, desired_time: float
 ) -> torch.Tensor:

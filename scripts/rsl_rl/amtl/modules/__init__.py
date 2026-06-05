@@ -7,12 +7,15 @@
 
 from amtl.actor_critic import ActorCritic
 from .actor_critic_recurrent import ActorCriticRecurrent
+from .amp import AmpDiscriminator, AmpReplayBuffer
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
 from .symmetry import resolve_symmetry_config
 
 __all__ = [
     "ActorCritic",
     "ActorCriticRecurrent",
+    "AmpDiscriminator",
+    "AmpReplayBuffer",
     "RandomNetworkDistillation",
     "resolve_rnd_config",
     "resolve_symmetry_config",

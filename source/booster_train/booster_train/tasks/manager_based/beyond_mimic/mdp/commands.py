@@ -14,6 +14,7 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.utils import configclass
 from isaaclab.utils.math import (
+    subtract_frame_transforms,
     quat_apply,
     quat_error_magnitude,
     quat_from_euler_xyz,
@@ -133,6 +134,7 @@ class MotionCommand(CommandTerm):
         self.metrics["sampling_entropy"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sampling_top1_prob"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sampling_top1_bin"] = torch.zeros(self.num_envs, device=self.device)
+        self._amp_end_effector_indices = self._resolve_amp_end_effector_indices()
 
     @property
     def command(self) -> torch.Tensor:  # TODO Consider again if this is the best observation
@@ -217,6 +219,109 @@ class MotionCommand(CommandTerm):
     @property
     def robot_anchor_ang_vel_w(self) -> torch.Tensor:
         return self.robot.data.body_ang_vel_w[:, self.robot_anchor_body_index]
+
+    @property
+    def amp_end_effector_names(self) -> list[str]:
+        return [self.cfg.body_names[index] for index in self._amp_end_effector_indices.tolist()]
+
+    @property
+    def amp_feature_dim(self) -> int:
+        return 6 + 2 * len(self.robot.joint_names) + 3 * len(self._amp_end_effector_indices)
+
+    def _resolve_amp_end_effector_indices(self) -> torch.Tensor:
+        preferred_names = (
+            "left_hand_link",
+            "right_hand_link",
+            "left_foot_link",
+            "right_foot_link",
+        )
+        end_effector_indices = [
+            self.cfg.body_names.index(name) for name in preferred_names if name in self.cfg.body_names
+        ]
+        if not end_effector_indices:
+            end_effector_indices = [
+                index
+                for index, name in enumerate(self.cfg.body_names)
+                if any(token in name.lower() for token in ("hand", "foot"))
+            ]
+        if not end_effector_indices:
+            raise RuntimeError(
+                "AMP requires at least one hand/foot body in MotionCommandCfg.body_names to build end-effector features."
+            )
+        return torch.tensor(end_effector_indices, dtype=torch.long, device=self.device)
+
+    def _compute_amp_end_effector_local_positions(
+        self,
+        body_pos_w: torch.Tensor,
+        anchor_pos_w: torch.Tensor,
+        anchor_quat_w: torch.Tensor,
+    ) -> torch.Tensor:
+        end_effector_pos_w = body_pos_w[:, self._amp_end_effector_indices]
+        num_end_effectors = end_effector_pos_w.shape[1]
+        end_effector_pos_b, _ = subtract_frame_transforms(
+            anchor_pos_w[:, None, :].repeat(1, num_end_effectors, 1),
+            anchor_quat_w[:, None, :].repeat(1, num_end_effectors, 1),
+            end_effector_pos_w,
+            anchor_quat_w[:, None, :].repeat(1, num_end_effectors, 1),
+        )
+        return end_effector_pos_b.reshape(end_effector_pos_b.shape[0], -1)
+
+    def _build_amp_features(
+        self,
+        root_lin_vel_w: torch.Tensor,
+        root_ang_vel_w: torch.Tensor,
+        joint_pos: torch.Tensor,
+        joint_vel: torch.Tensor,
+        body_pos_w: torch.Tensor,
+        anchor_pos_w: torch.Tensor,
+        anchor_quat_w: torch.Tensor,
+    ) -> torch.Tensor:
+        end_effector_pos_b = self._compute_amp_end_effector_local_positions(body_pos_w, anchor_pos_w, anchor_quat_w)
+        return torch.cat(
+            [
+                root_lin_vel_w,
+                root_ang_vel_w,
+                joint_pos,
+                joint_vel,
+                end_effector_pos_b,
+            ],
+            dim=-1,
+        )
+
+    def get_amp_policy_features(self) -> torch.Tensor:
+        return self._build_amp_features(
+            root_lin_vel_w=self.robot_anchor_lin_vel_w,
+            root_ang_vel_w=self.robot_anchor_ang_vel_w,
+            joint_pos=self.robot_joint_pos,
+            joint_vel=self.robot_joint_vel,
+            body_pos_w=self.robot_body_pos_w,
+            anchor_pos_w=self.robot_anchor_pos_w,
+            anchor_quat_w=self.robot_anchor_quat_w,
+        )
+
+    def get_amp_reference_features(self, frame_steps: torch.Tensor) -> torch.Tensor:
+        frame_steps = frame_steps.to(device=self.device, dtype=torch.long)
+        body_pos_w = self.motion.body_pos_w[frame_steps]
+        anchor_pos_w = self.motion.body_pos_w[frame_steps, self.motion_anchor_body_index]
+        anchor_quat_w = self.motion.body_quat_w[frame_steps, self.motion_anchor_body_index]
+        return self._build_amp_features(
+            root_lin_vel_w=self.motion.body_lin_vel_w[frame_steps, self.motion_anchor_body_index],
+            root_ang_vel_w=self.motion.body_ang_vel_w[frame_steps, self.motion_anchor_body_index],
+            joint_pos=self.motion.joint_pos[frame_steps],
+            joint_vel=self.motion.joint_vel[frame_steps],
+            body_pos_w=body_pos_w,
+            anchor_pos_w=anchor_pos_w,
+            anchor_quat_w=anchor_quat_w,
+        )
+
+    def sample_amp_reference_transitions(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if batch_size <= 0:
+            raise ValueError(f"AMP reference batch size must be positive. Received: {batch_size}.")
+
+        max_start_frame = max(self.motion.time_step_total - 1, 1)
+        frame_steps = torch.randint(0, max_start_frame, (batch_size,), device=self.device)
+        next_frame_steps = torch.clamp(frame_steps + 1, max=self.motion.time_step_total - 1)
+        return self.get_amp_reference_features(frame_steps), self.get_amp_reference_features(next_frame_steps)
 
     def _update_metrics(self):
         self.metrics["error_anchor_pos"] = torch.norm(self.anchor_pos_w - self.robot_anchor_pos_w, dim=-1)

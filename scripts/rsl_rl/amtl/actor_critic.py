@@ -118,6 +118,25 @@ class ActorCritic(nn.Module):
         return self.distribution.stddev
 
     @property
+    def learned_action_std_parameter(self) -> nn.Parameter | None:
+        if self.state_dependent_std:
+            return None
+        if self.noise_std_type == "scalar":
+            return self.std
+        if self.noise_std_type == "log":
+            return self.log_std
+        return None
+
+    def get_actor_mean_parameters(self) -> tuple[nn.Parameter, ...]:
+        return tuple(self.actor.parameters())
+
+    def get_actor_std_parameters(self) -> tuple[nn.Parameter, ...]:
+        std_param = self.learned_action_std_parameter
+        if std_param is None:
+            return ()
+        return (std_param,)
+
+    @property
     def entropy(self) -> torch.Tensor:
         return self.distribution.entropy().sum(dim=-1)
 
@@ -195,5 +214,28 @@ class ActorCritic(nn.Module):
             Whether this training resumes a previous training. This flag is used by the :func:`load` function of
                 :class:`OnPolicyRunner` to determine how to load further parameters (relevant for, e.g., distillation).
         """
-        super().load_state_dict(state_dict, strict=strict)
-        return True
+        try:
+            super().load_state_dict(state_dict, strict=strict)
+            return True
+        except RuntimeError as error:
+            current_state_dict = self.state_dict()
+            compatible_state_dict = {
+                key: value
+                for key, value in state_dict.items()
+                if key in current_state_dict and current_state_dict[key].shape == value.shape
+            }
+            incompatible_keys = sorted(
+                key
+                for key, value in state_dict.items()
+                if key in current_state_dict and current_state_dict[key].shape != value.shape
+            )
+
+            if not compatible_state_dict:
+                raise error
+
+            super().load_state_dict(compatible_state_dict, strict=False)
+            print(
+                "[WARN] Partially loaded checkpoint into ActorCritic. "
+                f"Skipped incompatible parameters: {incompatible_keys}"
+            )
+            return False

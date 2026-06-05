@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import csv
+import numpy as np
 import os
 import statistics
 import time
@@ -15,6 +17,7 @@ from tensordict import TensorDict
 
 from amtl.env import VecEnv
 from amtl.modules import ActorCriticRecurrent, resolve_rnd_config, resolve_symmetry_config
+from amtl.objective_metadata import get_objective_metadata
 from amtl.utils import resolve_obs_groups, store_code_state
 
 from amtl.actor_critic import ActorCritic
@@ -54,17 +57,115 @@ class OnPolicyRunner:
 
         # Logging
         self.log_dir = log_dir
+        if hasattr(self.alg, "set_log_dir"):
+            self.alg.set_log_dir(log_dir)
         self.writer = None
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [__file__]
+        self.objective_log_path = None if log_dir is None else os.path.join(log_dir, "pareto_objectives.csv")
+        self.objective_cosine_dir = None if log_dir is None else os.path.join(log_dir, "objective_cosines")
+        self._last_logged_objective_rows: list[dict[str, str | float | int]] = []
 
     @staticmethod
     def _extract_observations(obs: TensorDict | tuple[TensorDict, dict]) -> TensorDict:
         if isinstance(obs, tuple):
             return obs[0]
         return obs
+
+    def _summarize_episode_infos(self, ep_infos: list[dict]) -> dict[str, float]:
+        summary: dict[str, float] = {}
+        if not ep_infos:
+            return summary
+
+        keys = set()
+        for ep_info in ep_infos:
+            keys.update(ep_info.keys())
+
+        for key in sorted(keys):
+            infotensor = torch.tensor([], device=self.device)
+            for ep_info in ep_infos:
+                if key not in ep_info:
+                    continue
+                value = ep_info[key]
+                if not isinstance(value, torch.Tensor):
+                    value = torch.tensor([value], device=self.device)
+                else:
+                    value = value.to(self.device)
+                if len(value.shape) == 0:
+                    value = value.unsqueeze(0)
+                infotensor = torch.cat((infotensor, value))
+            if infotensor.numel() > 0:
+                summary[key] = torch.mean(infotensor).item()
+        return summary
+
+    def _append_objective_rows(self, objective_rows: list[dict[str, str | float | int]]) -> None:
+        if self.objective_log_path is None or not objective_rows:
+            return
+
+        os.makedirs(self.log_dir, exist_ok=True)
+        file_exists = os.path.exists(self.objective_log_path)
+        with open(self.objective_log_path, "a", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(
+                csv_file,
+                fieldnames=["iteration", "checkpoint_path", "objective_name", "raw_value", "weighted_value", "group_name"],
+            )
+            if not file_exists:
+                writer.writeheader()
+            writer.writerows(objective_rows)
+
+    def _build_objective_rows(
+        self, episode_summary: dict[str, float], iteration: int, checkpoint_path: str = ""
+    ) -> list[dict[str, str | float | int]]:
+        objective_rows: list[dict[str, str | float | int]] = []
+        raw_prefix = "Episode_ObjectiveRaw/"
+        weighted_prefix = "Episode_Reward/"
+
+        objective_names = {
+            key[len(raw_prefix) :] for key in episode_summary if key.startswith(raw_prefix)
+        } | {
+            key[len(weighted_prefix) :] for key in episode_summary if key.startswith(weighted_prefix)
+        }
+
+        for objective_name in sorted(objective_names):
+            metadata = get_objective_metadata(objective_name)
+            objective_rows.append(
+                {
+                    "iteration": iteration,
+                    "checkpoint_path": checkpoint_path,
+                    "objective_name": objective_name,
+                    "raw_value": episode_summary.get(f"{raw_prefix}{objective_name}", float("nan")),
+                    "weighted_value": episode_summary.get(f"{weighted_prefix}{objective_name}", float("nan")),
+                    "group_name": metadata.group_name,
+                }
+            )
+        return objective_rows
+
+    def _write_checkpoint_objective_snapshot(self, checkpoint_path: str) -> None:
+        if not self._last_logged_objective_rows:
+            return
+        if all(row.get("checkpoint_path") == checkpoint_path for row in self._last_logged_objective_rows):
+            return
+
+        checkpoint_rows = []
+        for row in self._last_logged_objective_rows:
+            checkpoint_row = dict(row)
+            checkpoint_row["checkpoint_path"] = checkpoint_path
+            checkpoint_rows.append(checkpoint_row)
+        self._append_objective_rows(checkpoint_rows)
+
+    def _save_objective_cosine_matrix(self, iteration: int) -> None:
+        if self.objective_cosine_dir is None or self.disable_logs:
+            return
+
+        cosine_matrix = getattr(self.alg, "latest_objective_cosine_matrix", None)
+        if cosine_matrix is None:
+            return
+
+        os.makedirs(self.objective_cosine_dir, exist_ok=True)
+        path = os.path.join(self.objective_cosine_dir, f"objective_cosines_iter_{iteration}.npy")
+        np.save(path, cosine_matrix.numpy())
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Initialize writer
@@ -157,13 +258,18 @@ class OnPolicyRunner:
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
+            checkpoint_path = ""
+            if self.log_dir is not None and it % self.save_interval == 0:
+                checkpoint_path = os.path.join(self.log_dir, f"model_{it}.pt")
 
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
                 self.log(locals())
+                if it % 25 == 0:
+                    self._save_objective_cosine_matrix(it)
                 # Save model
                 if it % self.save_interval == 0:
-                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                    self.save(checkpoint_path)
 
             # Clear episode infos
             ep_infos.clear()
@@ -178,7 +284,9 @@ class OnPolicyRunner:
 
         # Save the final model after training
         if self.log_dir is not None and not self.disable_logs:
-            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+            final_checkpoint_path = os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt")
+            self.save(final_checkpoint_path)
+            self._write_checkpoint_objective_snapshot(final_checkpoint_path)
 
     def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:
         # Compute the collection size
@@ -190,19 +298,9 @@ class OnPolicyRunner:
 
         # Log episode information
         ep_string = ""
+        episode_summary = self._summarize_episode_infos(locs["ep_infos"])
         if locs["ep_infos"]:
-            for key in locs["ep_infos"][0]:
-                infotensor = torch.tensor([], device=self.device)
-                for ep_info in locs["ep_infos"]:
-                    # Handle scalar and zero dimensional tensor infos
-                    if key not in ep_info:
-                        continue
-                    if not isinstance(ep_info[key], torch.Tensor):
-                        ep_info[key] = torch.Tensor([ep_info[key]])
-                    if len(ep_info[key].shape) == 0:
-                        ep_info[key] = ep_info[key].unsqueeze(0)
-                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
-                value = torch.mean(infotensor)
+            for key, value in episode_summary.items():
                 # Log to logger and terminal
                 if "/" in key:
                     self.writer.add_scalar(key, value, locs["it"])
@@ -210,6 +308,13 @@ class OnPolicyRunner:
                 else:
                     self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f"Mean episode {key}:":>{pad}} {value:.4f}\n"""
+
+        objective_rows = self._build_objective_rows(
+            episode_summary, locs["it"], checkpoint_path=locs.get("checkpoint_path", "")
+        )
+        if objective_rows:
+            self._append_objective_rows(objective_rows)
+            self._last_logged_objective_rows = objective_rows
 
         mean_std = self.alg.policy.action_std.mean()
         fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
@@ -307,6 +412,9 @@ class OnPolicyRunner:
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
+        if hasattr(self.alg, "amp_discriminator") and self.alg.amp_discriminator:
+            saved_dict["amp_discriminator_state_dict"] = self.alg.amp_discriminator.state_dict()
+            saved_dict["amp_optimizer_state_dict"] = self.alg.amp_optimizer.state_dict()
         torch.save(saved_dict, path)
 
         # Upload model to external logging service
@@ -320,6 +428,12 @@ class OnPolicyRunner:
         # Load RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+        if (
+            hasattr(self.alg, "amp_discriminator")
+            and self.alg.amp_discriminator
+            and "amp_discriminator_state_dict" in loaded_dict
+        ):
+            self.alg.amp_discriminator.load_state_dict(loaded_dict["amp_discriminator_state_dict"])
         # Load optimizer if used
         if load_optimizer and resumed_training:
             # Algorithm optimizer
@@ -327,6 +441,8 @@ class OnPolicyRunner:
             # RND optimizer if used
             if hasattr(self.alg, "rnd") and self.alg.rnd:
                 self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+            if hasattr(self.alg, "amp_optimizer") and self.alg.amp_optimizer and "amp_optimizer_state_dict" in loaded_dict:
+                self.alg.amp_optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
         # Load current learning iteration
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]

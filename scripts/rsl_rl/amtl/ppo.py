@@ -15,7 +15,7 @@ from collections.abc import Sequence
 from itertools import chain
 from tensordict import TensorDict
 
-from amtl.modules import ActorCriticRecurrent
+from amtl.modules import ActorCriticRecurrent, AmpDiscriminator, AmpReplayBuffer
 from amtl.modules.rnd import RandomNetworkDistillation
 from amtl.objective_metadata import get_objective_metadata
 from amtl.storage import RolloutStorage
@@ -142,6 +142,15 @@ class PPO:
         rnd_cfg: dict | None = None,
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
+        # AMP parameters
+        use_amp: bool = False,
+        amp_style_weight: float = 0.9,
+        amp_task_weight: float = 0.1,
+        amp_discriminator_lr: float = 2.0e-5,
+        amp_grad_penalty_weight: float = 10.0,
+        amp_replay_buffer_size: int = 200000,
+        amp_batch_size: int = 4096,
+        amp_as_separate_objective: bool = False,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -203,6 +212,31 @@ class PPO:
         optimizer_class = resolve_optimizer(optimizer)
         self.optimizer = optimizer_class(self.policy.parameters(), lr=learning_rate)
 
+        self.use_amp = use_amp
+        self.amp_style_weight = amp_style_weight
+        self.amp_task_weight = amp_task_weight
+        self.amp_grad_penalty_weight = amp_grad_penalty_weight
+        self.amp_batch_size = amp_batch_size
+        self.amp_as_separate_objective = amp_as_separate_objective
+        self.amp_discriminator: AmpDiscriminator | None = None
+        self.amp_optimizer: optim.Optimizer | None = None
+        self.amp_replay_buffer: AmpReplayBuffer | None = None
+        self._amp_episode_task_sums: torch.Tensor | None = None
+        self._amp_episode_style_sums: torch.Tensor | None = None
+
+        if self.use_amp:
+            motion_command = self._get_motion_command()
+            if motion_command is None:
+                raise RuntimeError("AMP is enabled, but no motion command was found on the environment.")
+            amp_feature_dim = motion_command.amp_feature_dim
+            self.amp_discriminator = AmpDiscriminator(state_feature_dim=amp_feature_dim).to(self.device)
+            self.amp_optimizer = optim.Adam(self.amp_discriminator.parameters(), lr=amp_discriminator_lr)
+            self.amp_replay_buffer = AmpReplayBuffer(
+                capacity=amp_replay_buffer_size,
+                transition_feature_dim=amp_feature_dim * 2,
+                device=self.device,
+            )
+
         # Create rollout storage
         self.storage: RolloutStorage | None = None
         self.transition = RolloutStorage.Transition()
@@ -251,6 +285,152 @@ class PPO:
                 return reward_manager
         return None
 
+    def _get_motion_command(self):
+        if self.env is None:
+            return None
+
+        for env_candidate in (self.env, getattr(self.env, "unwrapped", None)):
+            if env_candidate is None:
+                continue
+            command_manager = getattr(env_candidate, "command_manager", None)
+            if command_manager is None:
+                continue
+            try:
+                return command_manager.get_term("motion")
+            except Exception:
+                continue
+        return None
+
+    def _get_max_episode_length_s(self) -> float:
+        if self.env is None:
+            return 1.0
+
+        for env_candidate in (self.env, getattr(self.env, "unwrapped", None)):
+            if env_candidate is None:
+                continue
+            value = getattr(env_candidate, "max_episode_length_s", None)
+            if value is not None:
+                return float(value)
+        return 1.0
+
+    def _get_amp_transition_features(self, state_features_t: torch.Tensor, state_features_tp1: torch.Tensor) -> torch.Tensor:
+        return torch.cat([state_features_t, state_features_tp1], dim=-1)
+
+    def _append_amp_reward_terms(
+        self,
+        reward_terms: torch.Tensor | None,
+        amp_style_reward: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if reward_terms is None:
+            return None
+
+        scaled_reward_terms = reward_terms * self.amp_task_weight
+        if not self.amp_as_separate_objective:
+            return scaled_reward_terms
+
+        style_term = (self.amp_style_weight * amp_style_reward).unsqueeze(-1)
+        return torch.cat([scaled_reward_terms, style_term], dim=-1)
+
+    def _update_amp_episode_logs(
+        self,
+        dones: torch.Tensor,
+        extras: dict[str, torch.Tensor],
+        amp_task_reward: torch.Tensor,
+        amp_style_reward: torch.Tensor,
+    ) -> None:
+        if self._amp_episode_task_sums is None or self._amp_episode_style_sums is None:
+            return
+
+        self._amp_episode_task_sums += amp_task_reward
+        self._amp_episode_style_sums += amp_style_reward
+
+        done_ids = (dones > 0).nonzero(as_tuple=False).flatten()
+        if done_ids.numel() == 0:
+            return
+
+        max_episode_length_s = self._get_max_episode_length_s()
+        episode_log = extras.get("episode")
+        if episode_log is None:
+            episode_log = extras.get("log")
+        if episode_log is None:
+            episode_log = {}
+            extras["episode"] = episode_log
+
+        episode_log["Episode_Reward/amp_task"] = (
+            self._amp_episode_task_sums[done_ids].mean() / max_episode_length_s
+        )
+        episode_log["Episode_Reward/amp_style"] = (
+            self._amp_episode_style_sums[done_ids].mean() / max_episode_length_s
+        )
+
+        self._amp_episode_task_sums[done_ids] = 0.0
+        self._amp_episode_style_sums[done_ids] = 0.0
+
+    def _compute_amp_style_reward(self, state_features_t: torch.Tensor, state_features_tp1: torch.Tensor) -> torch.Tensor:
+        if not self.use_amp or self.amp_discriminator is None:
+            raise RuntimeError("AMP style reward requested while AMP is disabled.")
+
+        policy_scores = self.amp_discriminator(state_features_t, state_features_tp1)
+        return torch.clamp(1.0 - 0.25 * torch.square(policy_scores - 1.0), min=0.0)
+
+    def _update_amp_discriminator(self) -> dict[str, float]:
+        if not self.use_amp or self.amp_discriminator is None or self.amp_optimizer is None or self.amp_replay_buffer is None:
+            return {
+                "amp_discriminator": 0.0,
+                "amp_grad_penalty": 0.0,
+                "amp_ref_score": 0.0,
+                "amp_policy_score": 0.0,
+            }
+
+        if len(self.amp_replay_buffer) == 0:
+            return {
+                "amp_discriminator": 0.0,
+                "amp_grad_penalty": 0.0,
+                "amp_ref_score": 0.0,
+                "amp_policy_score": 0.0,
+            }
+
+        motion_command = self._get_motion_command()
+        if motion_command is None:
+            raise RuntimeError("AMP discriminator update requires the motion command.")
+
+        policy_transition_batch = self.amp_replay_buffer.sample(self.amp_batch_size)
+        batch_size = policy_transition_batch.shape[0]
+        ref_features_t, ref_features_tp1 = motion_command.sample_amp_reference_transitions(batch_size)
+        ref_transition_batch = self._get_amp_transition_features(ref_features_t, ref_features_tp1)
+
+        self.amp_optimizer.zero_grad()
+        ref_scores = self.amp_discriminator.forward_transition(ref_transition_batch)
+        policy_scores = self.amp_discriminator.forward_transition(policy_transition_batch)
+
+        ref_loss = torch.mean(torch.square(ref_scores - 1.0))
+        policy_loss = torch.mean(torch.square(policy_scores + 1.0))
+
+        alpha = torch.rand(batch_size, 1, device=self.device)
+        interpolated_transition = alpha * ref_transition_batch + (1.0 - alpha) * policy_transition_batch
+        interpolated_transition.requires_grad_(True)
+        interpolated_scores = self.amp_discriminator.forward_transition(interpolated_transition)
+        grad_outputs = torch.ones_like(interpolated_scores, device=self.device)
+        gradients = torch.autograd.grad(
+            outputs=interpolated_scores,
+            inputs=interpolated_transition,
+            grad_outputs=grad_outputs,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        grad_penalty = self.amp_grad_penalty_weight * torch.mean((gradients.norm(2, dim=-1) - 1.0) ** 2)
+
+        amp_loss = ref_loss + policy_loss + grad_penalty
+        amp_loss.backward()
+
+        return {
+            "amp_discriminator": amp_loss.item(),
+            "amp_grad_penalty": grad_penalty.item(),
+            "amp_ref_score": ref_scores.mean().item(),
+            "amp_policy_score": policy_scores.mean().item(),
+        }
+
     def _get_reward_terms(self) -> torch.Tensor | None:
         reward_manager = self._get_reward_manager()
         if reward_manager is None:
@@ -265,7 +445,10 @@ class PPO:
         reward_manager = self._get_reward_manager()
         if reward_manager is None or not hasattr(reward_manager, "active_terms"):
             return None
-        return list(reward_manager.active_terms)
+        reward_term_names = list(reward_manager.active_terms)
+        if self.use_amp and self.amp_as_separate_objective:
+            reward_term_names.append("amp_style")
+        return reward_term_names
 
     def _get_hybrid_term_indices(self) -> tuple[list[int], list[int]] | None:
         if self._hybrid_term_indices is not None:
@@ -559,6 +742,9 @@ class PPO:
             actions_shape,
             self.device,
         )
+        if self.use_amp:
+            self._amp_episode_task_sums = torch.zeros(num_envs, device=self.device)
+            self._amp_episode_style_sums = torch.zeros(num_envs, device=self.device)
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         if self.policy.is_recurrent:
@@ -571,6 +757,11 @@ class PPO:
         self.transition.action_sigma = self.policy.action_std.detach()
         # Record observations before env.step()
         self.transition.observations = obs
+        if self.use_amp:
+            motion_command = self._get_motion_command()
+            if motion_command is None:
+                raise RuntimeError("AMP rollout collection requires the motion command.")
+            self.transition.amp_state_features = motion_command.get_amp_policy_features().detach()
         return self.transition.actions
 
     def process_env_step(
@@ -583,9 +774,31 @@ class PPO:
 
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
-        self.transition.rewards = rewards.clone()
         reward_terms = self._get_reward_terms()
         self.transition.dones = dones
+        learning_rewards = rewards.clone()
+
+        if self.use_amp:
+            motion_command = self._get_motion_command()
+            if motion_command is None or self.transition.amp_state_features is None:
+                raise RuntimeError("AMP reward computation requires cached policy features and the motion command.")
+            next_amp_state_features = motion_command.get_amp_policy_features().detach()
+            amp_style_reward = self._compute_amp_style_reward(
+                self.transition.amp_state_features,
+                next_amp_state_features,
+            ).detach()
+            amp_task_reward = self.amp_task_weight * learning_rewards
+            amp_style_reward_weighted = self.amp_style_weight * amp_style_reward
+            learning_rewards = amp_task_reward + amp_style_reward_weighted
+            rewards.copy_(learning_rewards)
+            reward_terms = self._append_amp_reward_terms(reward_terms, amp_style_reward)
+            self._update_amp_episode_logs(dones, extras, amp_task_reward, amp_style_reward_weighted)
+            if self.amp_replay_buffer is not None:
+                self.amp_replay_buffer.add(
+                    self._get_amp_transition_features(self.transition.amp_state_features, next_amp_state_features)
+                )
+
+        self.transition.rewards = learning_rewards.clone()
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
@@ -670,6 +883,10 @@ class PPO:
         mean_objective_aligned_projections: dict[str, float] = {}
         objective_cosine_matrix_sum: torch.Tensor | None = None
         objective_cosine_matrix_count = 0
+        mean_amp_discriminator_loss = 0.0
+        mean_amp_grad_penalty = 0.0
+        mean_amp_ref_score = 0.0
+        mean_amp_policy_score = 0.0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -913,12 +1130,7 @@ class PPO:
             raw_objective_grad_fractions: dict[str, float] = {}
             ppo_blend_weight_value = 1.0
             amtl_blend_weight_value = 0.0
-
-
-
-
-
-
+            amp_stats = self._update_amp_discriminator() if self.use_amp else None
 
             if surrogate_losses_by_term is not None:
                 hybrid_term_indices = self._get_hybrid_term_indices()
@@ -1370,6 +1582,8 @@ class PPO:
             # Apply the gradients for PPO
           #  nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            if self.amp_optimizer:
+                self.amp_optimizer.step()
            # self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd_optimizer:
@@ -1425,6 +1639,11 @@ class PPO:
             mean_objective_grad_fraction_entropy += objective_grad_fraction_entropy_value
             mean_logged_ppo_blend_weight += ppo_blend_weight_value
             mean_logged_amtl_blend_weight += amtl_blend_weight_value
+            if amp_stats is not None:
+                mean_amp_discriminator_loss += amp_stats["amp_discriminator"]
+                mean_amp_grad_penalty += amp_stats["amp_grad_penalty"]
+                mean_amp_ref_score += amp_stats["amp_ref_score"]
+                mean_amp_policy_score += amp_stats["amp_policy_score"]
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -1483,6 +1702,10 @@ class PPO:
         mean_objective_grad_fraction_entropy /= num_updates
         mean_logged_ppo_blend_weight /= num_updates
         mean_logged_amtl_blend_weight /= num_updates
+        mean_amp_discriminator_loss /= num_updates
+        mean_amp_grad_penalty /= num_updates
+        mean_amp_ref_score /= num_updates
+        mean_amp_policy_score /= num_updates
         for objective_name in list(mean_objective_grad_norms):
             mean_objective_grad_norms[objective_name] /= num_updates
         for objective_name in list(mean_objective_grad_fractions):
@@ -1554,6 +1777,10 @@ class PPO:
             "ppo_blend_weight": mean_logged_ppo_blend_weight,
             "amtl_blend_weight": mean_logged_amtl_blend_weight,
             "blend_uses_ppo_true": 1.0,
+            "amp_discriminator": mean_amp_discriminator_loss,
+            "amp_grad_penalty": mean_amp_grad_penalty,
+            "amp_ref_score": mean_amp_ref_score,
+            "amp_policy_score": mean_amp_policy_score,
         }
         for objective_name, value in mean_objective_grad_norms.items():
             loss_dict[f"objective_grad_norm/{objective_name}"] = value
@@ -1575,12 +1802,18 @@ class PPO:
         model_params = [self.policy.state_dict()]
         if self.rnd:
             model_params.append(self.rnd.predictor.state_dict())
+        if self.amp_discriminator:
+            model_params.append(self.amp_discriminator.state_dict())
         # Broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # Load the model parameters on all GPUs from source GPU
         self.policy.load_state_dict(model_params[0])
+        state_index = 1
         if self.rnd:
-            self.rnd.predictor.load_state_dict(model_params[1])
+            self.rnd.predictor.load_state_dict(model_params[state_index])
+            state_index += 1
+        if self.amp_discriminator:
+            self.amp_discriminator.load_state_dict(model_params[state_index])
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
@@ -1591,6 +1824,8 @@ class PPO:
         grads = [param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None]
         if self.rnd:
             grads += [param.grad.view(-1) for param in self.rnd.parameters() if param.grad is not None]
+        if self.amp_discriminator:
+            grads += [param.grad.view(-1) for param in self.amp_discriminator.parameters() if param.grad is not None]
         all_grads = torch.cat(grads)
 
         # Average the gradients across all GPUs
@@ -1601,6 +1836,8 @@ class PPO:
         all_params = self.policy.parameters()
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
+        if self.amp_discriminator:
+            all_params = chain(all_params, self.amp_discriminator.parameters())
 
         # Update the gradients for all parameters with the reduced gradients
         offset = 0
