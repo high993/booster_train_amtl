@@ -26,6 +26,7 @@ class ActorCritic(nn.Module):
         critic_obs_normalization: bool = False,
         actor_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
         critic_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
+        num_critic_heads: int = 1,
         activation: str = "elu",
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
@@ -50,6 +51,7 @@ class ActorCritic(nn.Module):
             num_critic_obs += obs[obs_group].shape[-1]
 
         self.state_dependent_std = state_dependent_std
+        self.num_critic_heads = num_critic_heads
 
         # Actor
         if self.state_dependent_std:
@@ -66,7 +68,7 @@ class ActorCritic(nn.Module):
             self.actor_obs_normalizer = torch.nn.Identity()
 
         # Critic
-        self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
+        self.critic = MLP(num_critic_obs, num_critic_heads, critic_hidden_dims, activation)
         print(f"Critic MLP: {self.critic}")
 
         # Critic observation normalization
@@ -135,6 +137,12 @@ class ActorCritic(nn.Module):
         if std_param is None:
             return ()
         return (std_param,)
+
+    def get_actor_parameters(self) -> tuple[nn.Parameter, ...]:
+        return tuple(self.actor.parameters()) + self.get_actor_std_parameters()
+
+    def get_critic_parameters(self) -> tuple[nn.Parameter, ...]:
+        return tuple(self.critic.parameters())
 
     @property
     def entropy(self) -> torch.Tensor:

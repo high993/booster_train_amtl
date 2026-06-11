@@ -10,6 +10,8 @@ class ObjectiveMetadata:
 
 
 OBJECTIVE_METADATA: dict[str, ObjectiveMetadata] = {
+    "task_tracking": ObjectiveMetadata(group_name="Tracking", is_penalty=False),
+    "regularizer": ObjectiveMetadata(group_name="Regularizer", is_penalty=True),
     "motion_global_anchor_pos": ObjectiveMetadata(group_name="Tracking", is_penalty=False),
     "motion_global_anchor_ori": ObjectiveMetadata(group_name="Tracking", is_penalty=False),
     "motion_body_lin_vel": ObjectiveMetadata(group_name="Tracking", is_penalty=False),

@@ -535,6 +535,14 @@ class OnPolicyRunner:
             if self.policy_cfg.get("critic_obs_normalization") is None:
                 self.policy_cfg["critic_obs_normalization"] = self.cfg["empirical_normalization"]
 
+        if self.alg_cfg.get("class_name") == "PPO" and self.policy_cfg.get("num_critic_heads") is None:
+            reward_manager = getattr(self.env, "reward_manager", None)
+            if reward_manager is None:
+                reward_manager = getattr(getattr(self.env, "unwrapped", None), "reward_manager", None)
+            active_terms = getattr(reward_manager, "active_terms", None)
+            if active_terms:
+                self.policy_cfg["num_critic_heads"] = len(active_terms)
+
         # Initialize the policy
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
         actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(

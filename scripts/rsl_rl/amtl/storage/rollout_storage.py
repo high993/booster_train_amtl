@@ -39,6 +39,7 @@ class RolloutStorage:
         num_transitions_per_env: int,
         obs: TensorDict,
         actions_shape: tuple[int] | list[int],
+        value_size: int = 1,
         device: str = "cpu",
     ) -> None:
         self.training_type = training_type
@@ -46,6 +47,7 @@ class RolloutStorage:
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
         self.actions_shape = actions_shape
+        self.value_size = value_size
 
         # Core
         self.observations = TensorDict(
@@ -64,7 +66,7 @@ class RolloutStorage:
 
         # For reinforcement learning
         if training_type == "rl":
-            self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.values = torch.zeros(num_transitions_per_env, num_envs, value_size, device=self.device)
             self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
@@ -94,6 +96,11 @@ class RolloutStorage:
         num_reward_terms = reward_terms.shape[1]
 
         if self.reward_terms is None:
+            if self.training_type == "rl" and self.value_size > 1 and num_reward_terms != self.value_size:
+                raise ValueError(
+                    f"Multi-head critic output size ({self.value_size}) does not match "
+                    f"the number of reward terms ({num_reward_terms})."
+                )
             self.reward_terms = torch.zeros(
                 self.num_transitions_per_env, num_envs := self.num_envs, num_reward_terms, device=self.device
             )
@@ -110,6 +117,11 @@ class RolloutStorage:
             raise ValueError(
                 f"Inconsistent number of reward terms in rollout storage. "
                 f"Expected {self.num_reward_terms}, got {reward_terms.shape[1]}."
+            )
+        if self.training_type == "rl" and self.value_size > 1 and reward_terms.shape[1] != self.value_size:
+            raise ValueError(
+                f"Multi-head critic output size ({self.value_size}) does not match "
+                f"the number of reward terms ({reward_terms.shape[1]})."
             )
 
     def add_transitions(self, transition: Transition) -> None:
@@ -170,40 +182,54 @@ class RolloutStorage:
     def compute_returns(
         self, last_values: torch.Tensor, gamma: float, lam: float, normalize_advantage: bool = True
     ) -> None:
+        scalar_last_values = last_values.sum(dim=-1, keepdim=True) if last_values.shape[-1] > 1 else last_values
+        scalar_values = self.values.sum(dim=-1, keepdim=True) if self.values.shape[-1] > 1 else self.values
+
         advantage = 0
         for step in reversed(range(self.num_transitions_per_env)):
             # If we are at the last step, bootstrap the return value
-            next_values = last_values if step == self.num_transitions_per_env - 1 else self.values[step + 1]
+            next_values = scalar_last_values if step == self.num_transitions_per_env - 1 else scalar_values[step + 1]
             # 1 if we are not in a terminal state, 0 otherwise
             next_is_not_terminal = 1.0 - self.dones[step].float()
             # TD error: r_t + gamma * V(s_{t+1}) - V(s_t)
-            delta = self.rewards[step] + next_is_not_terminal * gamma * next_values - self.values[step]
+            delta = self.rewards[step] + next_is_not_terminal * gamma * next_values - scalar_values[step]
             # Advantage: A(s_t, a_t) = delta_t + gamma * lambda * A(s_{t+1}, a_{t+1})
             advantage = delta + next_is_not_terminal * gamma * lam * advantage
             # Return: R_t = A(s_t, a_t) + V(s_t)
-            self.returns[step] = advantage + self.values[step]
+            self.returns[step] = advantage + scalar_values[step]
 
         # Compute the advantages
-        self.advantages = self.returns - self.values
+        self.advantages = self.returns - scalar_values
         # Normalize the advantages if flag is set
         # Note: This is to prevent double normalization (i.e. if per minibatch normalization is used)
         if normalize_advantage:
             self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
 
 
-        #adv by each individual term (no grouping)
+        # Adv by each individual term (no grouping)
         if self.reward_terms is not None:
+            if self.values.shape[-1] == 1:
+                critic_values = self.values.expand(-1, -1, self.num_reward_terms)
+                critic_last_values = last_values.expand(-1, self.num_reward_terms)
+            else:
+                if self.values.shape[-1] != self.num_reward_terms:
+                    raise ValueError(
+                        f"Multi-head critic output size ({self.values.shape[-1]}) does not match "
+                        f"the number of reward terms ({self.num_reward_terms})."
+                    )
+                critic_values = self.values
+                critic_last_values = last_values
+
             advantage_by_term = torch.zeros(self.num_envs, self.num_reward_terms, device=self.device)
             for step in reversed(range(self.num_transitions_per_env)):
-                next_values = last_values if step == self.num_transitions_per_env - 1 else self.values[step + 1]
+                next_values = critic_last_values if step == self.num_transitions_per_env - 1 else critic_values[step + 1]
                 next_is_not_terminal = 1.0 - self.dones[step].float()
-                current_values = self.values[step].expand(-1, self.num_reward_terms)
-                next_values = next_values.expand(-1, self.num_reward_terms)
+                current_values = critic_values[step]
                 delta_by_term = self.reward_terms[step] + next_is_not_terminal * gamma * next_values - current_values
                 advantage_by_term = delta_by_term + next_is_not_terminal * gamma * lam * advantage_by_term
                 self.returns_by_term[step] = advantage_by_term + current_values
 
-            self.advantages_by_term = self.returns_by_term - self.values.expand(-1, -1, self.num_reward_terms)
+            self.advantages_by_term = self.returns_by_term - critic_values
             if normalize_advantage:
                 mean = self.advantages_by_term.mean(dim=(0, 1), keepdim=True)
                 std = self.advantages_by_term.std(dim=(0, 1), keepdim=True)
@@ -230,10 +256,10 @@ class RolloutStorage:
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
-
+        scalar_returns = returns
+        scalar_advantages = self.advantages.flatten(0, 1)
         # For PPO
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
-        advantages = self.advantages.flatten(0, 1)
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
         advantages_by_term = self.advantages_by_term.flatten(0, 1) if self.advantages_by_term is not None else None
@@ -250,9 +276,9 @@ class RolloutStorage:
                 obs_batch = observations[batch_idx]
                 actions_batch = actions[batch_idx]
                 target_values_batch = values[batch_idx]
-                returns_batch = returns[batch_idx]
+                returns_batch = scalar_returns[batch_idx]
                 old_actions_log_prob_batch = old_actions_log_prob[batch_idx]
-                advantages_batch = advantages[batch_idx]
+                advantages_batch = scalar_advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
                 advantages_by_term_batch = advantages_by_term[batch_idx] if advantages_by_term is not None else None

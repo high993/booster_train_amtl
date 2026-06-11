@@ -27,6 +27,7 @@ class ActorCriticRecurrent(nn.Module):
         critic_obs_normalization: bool = False,
         actor_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
         critic_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
+        num_critic_heads: int = 1,
         activation: str = "elu",
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
@@ -62,6 +63,7 @@ class ActorCriticRecurrent(nn.Module):
             num_critic_obs += obs[obs_group].shape[-1]
 
         self.state_dependent_std = state_dependent_std
+        self.num_critic_heads = num_critic_heads
 
         # Actor
         self.memory_a = Memory(num_actor_obs, rnn_hidden_dim, rnn_num_layers, rnn_type)
@@ -81,7 +83,7 @@ class ActorCriticRecurrent(nn.Module):
 
         # Critic
         self.memory_c = Memory(num_critic_obs, rnn_hidden_dim, rnn_num_layers, rnn_type)
-        self.critic = MLP(rnn_hidden_dim, 1, critic_hidden_dims, activation)
+        self.critic = MLP(rnn_hidden_dim, num_critic_heads, critic_hidden_dims, activation)
         print(f"Critic RNN: {self.memory_c}")
         print(f"Critic MLP: {self.critic}")
 
@@ -130,6 +132,19 @@ class ActorCriticRecurrent(nn.Module):
     @property
     def entropy(self) -> torch.Tensor:
         return self.distribution.entropy().sum(dim=-1)
+
+    def get_actor_parameters(self) -> tuple[nn.Parameter, ...]:
+        actor_params = tuple(self.memory_a.parameters()) + tuple(self.actor.parameters())
+        if self.state_dependent_std:
+            return actor_params
+        if self.noise_std_type == "scalar":
+            return actor_params + (self.std,)
+        if self.noise_std_type == "log":
+            return actor_params + (self.log_std,)
+        return actor_params
+
+    def get_critic_parameters(self) -> tuple[nn.Parameter, ...]:
+        return tuple(self.memory_c.parameters()) + tuple(self.critic.parameters())
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         self.memory_a.reset(dones)
@@ -220,5 +235,28 @@ class ActorCriticRecurrent(nn.Module):
             Whether this training resumes a previous training. This flag is used by the :func:`load` function of
                 :class:`OnPolicyRunner` to determine how to load further parameters (relevant for, e.g., distillation).
         """
-        super().load_state_dict(state_dict, strict=strict)
-        return True
+        try:
+            super().load_state_dict(state_dict, strict=strict)
+            return True
+        except RuntimeError as error:
+            current_state_dict = self.state_dict()
+            compatible_state_dict = {
+                key: value
+                for key, value in state_dict.items()
+                if key in current_state_dict and current_state_dict[key].shape == value.shape
+            }
+            incompatible_keys = sorted(
+                key
+                for key, value in state_dict.items()
+                if key in current_state_dict and current_state_dict[key].shape != value.shape
+            )
+
+            if not compatible_state_dict:
+                raise error
+
+            super().load_state_dict(compatible_state_dict, strict=False)
+            print(
+                "[WARN] Partially loaded checkpoint into ActorCriticRecurrent. "
+                f"Skipped incompatible parameters: {incompatible_keys}"
+            )
+            return False

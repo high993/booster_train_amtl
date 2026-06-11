@@ -4,22 +4,9 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 @configclass
 class AmtlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
-    beta_reg: float = 0.25
-    max_reg_scale: float = 1.0
-    use_blended_actor_update: bool = True
-    ppo_blend_weight: float = 0.8
-    amtl_blend_weight: float = 0.2
-    blend_schedule: str = "constant"
-    blend_transition_start: int = 5000
-    blend_transition_end: int = 15000
-    use_amp: bool = False
-    amp_style_weight: float = 0.5
-    amp_task_weight: float = 0.5
-    amp_discriminator_lr: float = 1.0e-4
-    amp_grad_penalty_weight: float = 10.0
-    amp_replay_buffer_size: int = 200000
-    amp_batch_size: int = 4096
-    amp_as_separate_objective: bool = False
+    amtl_apply_to: str = "critic"
+    debug_amtl: bool = False
+    debug_amtl_log_interval: int = 100
 
 
 @configclass
@@ -52,22 +39,9 @@ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,
-        beta_reg=0.25,
-        max_reg_scale=1.0,
-        use_blended_actor_update=True,
-        ppo_blend_weight=0.8,
-        amtl_blend_weight=0.2,
-        blend_schedule="constant",
-        blend_transition_start=5000,
-        blend_transition_end=15000,
-        use_amp=False,
-        amp_style_weight=0.5,
-        amp_task_weight=0.5,
-        amp_discriminator_lr=1.0e-4,
-        amp_grad_penalty_weight=10.0,
-        amp_replay_buffer_size=200000,
-        amp_batch_size=4096,
-        amp_as_separate_objective=False,
+        amtl_apply_to="critic",
+        debug_amtl=False,
+        debug_amtl_log_interval=100,
     )
 
 

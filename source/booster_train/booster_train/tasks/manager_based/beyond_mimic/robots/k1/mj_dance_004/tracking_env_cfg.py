@@ -253,7 +253,7 @@ class RewardsCfg:
     motion_foot_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,
         weight=15.0,
-        params={"command_name": "motion", "std": 0.2, "body_names": ["left_foot_link", "right_foot_link"]},
+        params={"command_name": "motion", "std": 0.4, "body_names": ["left_foot_link", "right_foot_link"]},
     )
 
     # motion_foot_pitch_penalty = RewTerm(
@@ -265,31 +265,31 @@ class RewardsCfg:
     motion_hand_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,
         weight=3.0,
-        params={"command_name": "motion", "std": 0.2, "body_names": ["left_hand_link", "right_hand_link"]},
+        params={"command_name": "motion", "std": 0.4, "body_names": ["left_hand_link", "right_hand_link"]},
     )
 
     motion_foot_pos = RewTerm(
         func=mdp.motion_relative_body_position_error_exp,
         weight=15.0,
-        params={"command_name": "motion", "std": 0.2, "body_names": ["left_foot_link", "right_foot_link"]},
+        params={"command_name": "motion", "std": 0.4, "body_names": ["left_foot_link", "right_foot_link"]},
     )
 
     motion_hand_pos = RewTerm(
         func=mdp.motion_relative_body_position_error_exp,
         weight=8.0,
-        params={"command_name": "motion", "std": 0.2, "body_names": ["left_hand_link", "right_hand_link"]},
+        params={"command_name": "motion", "std": 0.4, "body_names": ["left_hand_link", "right_hand_link"]},
     )
 
     motion_trunk_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,
         weight=10.0,
-        params={"command_name": "motion", "std": 0.2, "body_names": ["Trunk"]},
+        params={"command_name": "motion", "std": 0.4, "body_names": ["Trunk"]},
     )  
 
     motion_trunk_pos = RewTerm(
         func=mdp.motion_relative_body_position_error_exp,
         weight=20.0,
-        params={"command_name": "motion", "std": 0.2, "body_names": ["Trunk"]},
+        params={"command_name": "motion", "std": 0.4, "body_names": ["Trunk"]},
     )
 
 
