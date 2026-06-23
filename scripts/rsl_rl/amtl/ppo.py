@@ -128,9 +128,9 @@ class PPO:
         lam: float = 0.95,
         value_loss_coef: float = 1.0,
         entropy_coef: float = 0.01,
-        learning_rate: float = 0.001,
+        learning_rate: float = 0.00025,
         optimizer: str = "adam",
-        max_grad_norm: float = 1.0,
+        max_grad_norm: float = 0.5,
         use_clipped_value_loss: bool = True,
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
@@ -138,7 +138,7 @@ class PPO:
         device: str = "cpu",
         env=None,
         normalize_advantage_per_mini_batch: bool = False,
-        amtl_apply_to: str = "critic",
+        amtl_apply_to: str = "actor",
         debug_amtl: bool = False,
         debug_amtl_log_interval: int = 100,
         # RND parameters
@@ -154,17 +154,20 @@ class PPO:
         if legacy_align_actor is not None or legacy_align_critic is not None:
             warnings.warn(
                 "The `align_actor_all_terms` and `align_critic` flags are deprecated. "
-                "Use `amtl_apply_to=\"critic\"` for the critic-only AMTL setup.",
+                "Use `amtl_apply_to=\"actor\"` for the actor-only AMTL setup.",
                 stacklevel=2,
             )
-            if legacy_align_actor:
-                raise ValueError("Actor-side AMTL is disabled in this critic-only PPO branch.")
-            if legacy_align_critic and amtl_apply_to == "none":
-                amtl_apply_to = "critic"
+            if legacy_align_actor and amtl_apply_to == "none":
+                amtl_apply_to = "actor"
+            if legacy_align_critic:
+                warnings.warn(
+                    "Critic-side AMTL is disabled in this PPO branch. The deprecated `align_critic` flag is ignored.",
+                    stacklevel=2,
+                )
 
-        if amtl_apply_to not in {"none", "critic"}:
+        if amtl_apply_to not in {"none", "actor"}:
             raise ValueError(
-                f"Unsupported amtl_apply_to='{amtl_apply_to}'. This branch supports only 'none' and 'critic'."
+                f"Unsupported amtl_apply_to='{amtl_apply_to}'. This branch supports only 'none' and 'actor'."
             )
 
         if legacy_kwargs:
@@ -252,14 +255,16 @@ class PPO:
         self.learning_rate = learning_rate
         self.share_cnn_encoders = share_cnn_encoders
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
-        # This branch only supports critic-side AMTL. The actor always stays on
-        # the standard PPO clipped surrogate path.
+        # This branch only supports actor-side AMTL. The critic always stays on
+        # the standard PPO value-loss path.
         self.amtl_apply_to = amtl_apply_to
-        self.use_actor_amtl = False
-        self.use_critic_amtl = amtl_apply_to == "critic"
+        self.use_actor_amtl = amtl_apply_to == "actor"
+        self.use_critic_amtl = False
         self.debug_amtl = debug_amtl
         self.debug_amtl_log_interval = debug_amtl_log_interval
         self.update_counter = 0
+        self._amtl_diagnostics_printed = False
+        self._pairwise_cosine_sanity_printed = False
 
     def _get_reward_manager(self):
         if self.env is None:
@@ -295,15 +300,21 @@ class PPO:
             return reward_term_names
         return [f"head_{index:02d}" for index in range(num_heads)]
 
+    def _get_actor_objective_names(self, num_objectives: int) -> list[str]:
+        reward_term_names = self._get_reward_term_names()
+        if reward_term_names is not None and len(reward_term_names) == num_objectives:
+            return reward_term_names
+        return [f"objective_{index:02d}" for index in range(num_objectives)]
+
     def _validate_actor_critic_parameter_partition(self) -> None:
-        # Critic-only AMTL temporarily zeroes and rewrites critic grads, so the
+        # AMTL temporarily zeroes and rewrites one side's gradients, so the
         # actor/critic parameter sets must stay disjoint.
         actor_param_ids = {id(param) for param in self.policy.get_actor_parameters()}
         critic_param_ids = {id(param) for param in self.policy.get_critic_parameters()}
         shared_param_count = len(actor_param_ids & critic_param_ids)
         if shared_param_count > 0:
             raise RuntimeError(
-                "Critic-only AMTL currently requires disjoint actor/critic parameters, "
+                "AMTL currently requires disjoint actor/critic parameters, "
                 f"but found {shared_param_count} shared parameter(s)."
             )
 
@@ -321,6 +332,156 @@ class PPO:
                 for param in params
             ]
         )
+
+    @staticmethod
+    def _flatten_grad_list(
+        grads: Sequence[torch.Tensor | None], params: Sequence[torch.nn.Parameter]
+    ) -> torch.Tensor:
+        return torch.cat(
+            [
+                grad.reshape(-1) if grad is not None else torch.zeros_like(param).reshape(-1)
+                for grad, param in zip(grads, params, strict=True)
+            ]
+        )
+
+    @staticmethod
+    def _parameter_count(params: Sequence[torch.nn.Parameter]) -> int:
+        return sum(param.numel() for param in params)
+
+    @staticmethod
+    def _pairwise_cosine_stats(grad_matrix: torch.Tensor) -> dict[str, float]:
+        if grad_matrix.ndim != 2:
+            raise ValueError(f"Expected [num_objectives, num_parameters], got {tuple(grad_matrix.shape)}.")
+        num_objectives = grad_matrix.shape[0]
+        if num_objectives <= 1:
+            return {
+                "mean": 1.0,
+                "min": 1.0,
+                "max": 1.0,
+                "conflict_fraction": 0.0,
+                "near_zero_row_count": 0.0,
+            }
+
+        row_norms = grad_matrix.norm(p=2, dim=1, keepdim=True)
+        normalized_grads = grad_matrix / row_norms.clamp_min(1.0e-12)
+        near_zero_rows = row_norms.squeeze(1) <= 1.0e-12
+        if near_zero_rows.any():
+            normalized_grads = normalized_grads.clone()
+            normalized_grads[near_zero_rows] = 0.0
+
+        cosine_matrix = normalized_grads @ normalized_grads.T
+        pair_indices = torch.triu_indices(num_objectives, num_objectives, offset=1, device=grad_matrix.device)
+        pairwise_cosines = cosine_matrix[pair_indices[0], pair_indices[1]]
+        if pairwise_cosines.numel() == 0:
+            return {
+                "mean": 1.0,
+                "min": 1.0,
+                "max": 1.0,
+                "conflict_fraction": 0.0,
+                "near_zero_row_count": float(near_zero_rows.sum().item()),
+            }
+
+        return {
+            "mean": pairwise_cosines.mean().item(),
+            "min": pairwise_cosines.min().item(),
+            "max": pairwise_cosines.max().item(),
+            "conflict_fraction": (pairwise_cosines < 0).float().mean().item(),
+            "near_zero_row_count": float(near_zero_rows.sum().item()),
+        }
+
+    @classmethod
+    def _mean_pairwise_cosine(cls, grad_matrix: torch.Tensor) -> float:
+        return cls._pairwise_cosine_stats(grad_matrix)["mean"]
+
+    @staticmethod
+    def _safe_cosine_similarity(vec_a: torch.Tensor, vec_b: torch.Tensor, eps: float = 1.0e-12) -> float:
+        norm_a = vec_a.norm()
+        norm_b = vec_b.norm()
+        denom = norm_a * norm_b
+        if denom.item() <= eps:
+            return 0.0
+        return (torch.dot(vec_a, vec_b) / denom).item()
+
+    @staticmethod
+    def _cosine_against_reference(
+        grad_matrix: torch.Tensor, reference_grad: torch.Tensor, eps: float = 1.0e-12
+    ) -> torch.Tensor:
+        if grad_matrix.ndim != 2:
+            raise ValueError(f"Expected [num_objectives, num_parameters], got {tuple(grad_matrix.shape)}.")
+        if reference_grad.ndim != 1:
+            raise ValueError(f"Expected reference gradient [num_parameters], got {tuple(reference_grad.shape)}.")
+
+        reference_norm = reference_grad.norm()
+        row_norms = grad_matrix.norm(dim=1)
+        dots = grad_matrix @ reference_grad
+        denom = row_norms * reference_norm
+        return torch.where(denom > eps, dots / denom.clamp_min(eps), torch.zeros_like(dots))
+
+    def _print_pairwise_cosine_sanity_once(self, device: torch.device | str) -> None:
+        if self._pairwise_cosine_sanity_printed or self.gpu_global_rank != 0:
+            return
+
+        test = torch.tensor([[1.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0]], device=device)
+        row_norms = test.norm(p=2, dim=1, keepdim=True)
+        normalized_test = test / row_norms.clamp_min(1.0e-12)
+        cosine_matrix = normalized_test @ normalized_test.T
+        pair_indices = torch.triu_indices(test.shape[0], test.shape[0], offset=1, device=test.device)
+        pairwise_cosines = cosine_matrix[pair_indices[0], pair_indices[1]]
+        cosine_stats = self._pairwise_cosine_stats(test)
+
+        print(f"pairwise_cosine_sanity_test_shape={tuple(test.shape)}")
+        print(f"pairwise_cosine_sanity_test_pairs={pairwise_cosines.detach().cpu().tolist()}")
+        print(f"pairwise_cosine_sanity_test_mean={cosine_stats['mean']}")
+        self._pairwise_cosine_sanity_printed = True
+
+    def _print_actor_amtl_diagnostics_once(
+        self,
+        stacked_actor_grads: torch.Tensor,
+        aligned_actor_grads: torch.Tensor,
+        aligned_actor_grad_matrix: torch.Tensor,
+        raw_actor_cosine_stats: dict[str, float],
+        aligned_actor_cosine_stats: dict[str, float],
+        actor_amtl_vs_ppo_cosine: float,
+        actor_amtl_projection_ratio: float,
+        actor_amtl_orthogonal_ratio: float,
+        objective_vs_ppo_cosines: torch.Tensor,
+        amtl_vs_objective_cosines: torch.Tensor,
+        actor_params: Sequence[torch.nn.Parameter],
+        critic_params: Sequence[torch.nn.Parameter],
+    ) -> None:
+        if self._amtl_diagnostics_printed or self.gpu_global_rank != 0:
+            return
+        self._print_pairwise_cosine_sanity_once(stacked_actor_grads.device)
+        print(f"number_of_actor_objectives={stacked_actor_grads.shape[0]}")
+        print(f"number_of_actor_gradients={stacked_actor_grads.shape[0]}")
+        print(f"stacked_actor_gradient_shape={tuple(stacked_actor_grads.shape)}")
+        print(f"stacked_actor_grads.shape={tuple(stacked_actor_grads.shape)}")
+        print(f"aligned_actor_grads.shape={tuple(aligned_actor_grads.shape)}")
+        print(f"aligned_actor_grad_matrix.shape={tuple(aligned_actor_grad_matrix.shape)}")
+        print(f"actor_parameter_count={self._parameter_count(actor_params)}")
+        print(f"critic_parameter_count={self._parameter_count(critic_params)}")
+        print(f"actor_raw_mean_cosine={raw_actor_cosine_stats['mean']}")
+        print(f"actor_raw_min_cosine={raw_actor_cosine_stats['min']}")
+        print(f"actor_raw_max_cosine={raw_actor_cosine_stats['max']}")
+        print(f"actor_raw_conflict_fraction={raw_actor_cosine_stats['conflict_fraction']}")
+        print(f"actor_raw_near_zero_row_count={raw_actor_cosine_stats['near_zero_row_count']}")
+        print(f"actor_aligned_mean_cosine={aligned_actor_cosine_stats['mean']}")
+        print(f"actor_aligned_min_cosine={aligned_actor_cosine_stats['min']}")
+        print(f"actor_aligned_max_cosine={aligned_actor_cosine_stats['max']}")
+        print(f"actor_aligned_conflict_fraction={aligned_actor_cosine_stats['conflict_fraction']}")
+        print(f"actor_aligned_near_zero_row_count={aligned_actor_cosine_stats['near_zero_row_count']}")
+        print(f"actor_amtl_vs_ppo_cosine={actor_amtl_vs_ppo_cosine}")
+        print(f"actor_amtl_projection_ratio={actor_amtl_projection_ratio}")
+        print(f"actor_amtl_orthogonal_ratio={actor_amtl_orthogonal_ratio}")
+        print(
+            "actor_objective_vs_ppo_cosine_min_mean_max="
+            f"({objective_vs_ppo_cosines.min().item()}, {objective_vs_ppo_cosines.mean().item()}, {objective_vs_ppo_cosines.max().item()})"
+        )
+        print(
+            "actor_amtl_vs_objective_cosine_min_mean_max="
+            f"({amtl_vs_objective_cosines.min().item()}, {amtl_vs_objective_cosines.mean().item()}, {amtl_vs_objective_cosines.max().item()})"
+        )
+        self._amtl_diagnostics_printed = True
     '''
     def _flatten_grad_list(
         self, grads: Sequence[torch.Tensor | None], params: Sequence[torch.nn.Parameter]
@@ -447,7 +608,7 @@ class PPO:
         )
 
     # Kept only as a historical reference while this branch uses the
-    # critic-only `update()` implementation below.
+    # actor-only `update()` implementation below.
     def _update_experimental_actor_amtl_legacy(self) -> dict[str, float]:
         mean_value_loss = 0
         mean_surrogate_loss = 0
@@ -944,18 +1105,45 @@ class PPO:
         return loss_dict
 
     def update(self) -> dict[str, float]:
-        """Critic-only AMTL update.
+        """Actor-only AMTL update.
 
-        The actor uses the standard PPO clipped surrogate. Only the per-head
-        critic losses participate in AMTL gradient alignment.
+        The actor aligns per-objective PPO surrogate gradients with Procrustes.
+        The critic always uses the standard PPO value-loss path without AMTL.
         """
 
         mean_value_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
         mean_kl_divergence = 0.0
+        mean_actor_amtl_grad_norm = 0.0
+        mean_num_actor_objectives = 0.0
+        mean_actor_raw_mean_cosine = 0.0
+        mean_actor_raw_min_cosine = 0.0
+        mean_actor_raw_max_cosine = 0.0
+        mean_actor_raw_conflict_fraction = 0.0
+        mean_actor_aligned_mean_cosine = 0.0
+        mean_actor_aligned_min_cosine = 0.0
+        mean_actor_aligned_max_cosine = 0.0
+        mean_actor_aligned_conflict_fraction = 0.0
+        mean_actor_alignment_mean_cosine = 0.0
+        mean_actor_amtl_vs_ppo_cosine = 0.0
+        mean_actor_amtl_projection_on_ppo = 0.0
+        mean_actor_amtl_projection_ratio = 0.0
+        mean_actor_amtl_parallel_norm = 0.0
+        mean_actor_amtl_orthogonal_norm = 0.0
+        mean_actor_amtl_orthogonal_ratio = 0.0
+        mean_actor_objective_vs_ppo_cosine_min = 0.0
+        mean_actor_objective_vs_ppo_cosine_max = 0.0
+        mean_actor_objective_vs_ppo_cosine_mean = 0.0
+        mean_actor_amtl_vs_objective_cosine_min = 0.0
+        mean_actor_amtl_vs_objective_cosine_max = 0.0
+        mean_actor_amtl_vs_objective_cosine_mean = 0.0
+        mean_actor_scale = 0.0
         mean_critic_amtl_grad_norm = 0.0
         critic_value_loss_sums: torch.Tensor | None = None
+        action_entropy_sums: torch.Tensor | None = None
+        actor_objective_vs_ppo_cosine_sums: torch.Tensor | None = None
+        actor_amtl_vs_objective_cosine_sums: torch.Tensor | None = None
         mean_rnd_loss = 0.0 if self.rnd else None
         mean_symmetry_loss = 0.0 if self.symmetry else None
 
@@ -1012,6 +1200,7 @@ class PPO:
             value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
+            action_entropy_batch = self.policy.distribution.entropy()[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
 
             kl_mean_value = 0.0
@@ -1045,13 +1234,18 @@ class PPO:
 
                     kl_mean_value = kl_mean.item()
 
-            # Actor AMTL is OFF here by design. The actor uses standard PPO with
-            # the scalar summed advantage and the clipped surrogate objective.
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             clipped_ratio = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * clipped_ratio
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            surrogate_losses_by_term = None
+            if advantages_by_term_batch is not None:
+                surrogate_by_term = -advantages_by_term_batch * ratio.unsqueeze(-1)
+                surrogate_clipped_by_term = -advantages_by_term_batch * clipped_ratio.unsqueeze(-1)
+                surrogate_losses_by_term = torch.max(surrogate_by_term, surrogate_clipped_by_term).reshape(
+                    -1, advantages_by_term_batch.shape[-1]
+                ).mean(dim=0)
 
             critic_losses_by_term = None
             if returns_by_term_batch is not None:
@@ -1118,33 +1312,127 @@ class PPO:
                 rnd_loss = torch.nn.MSELoss()(predicted_embedding, target_embedding)
 
             self.optimizer.zero_grad()
+            actor_params = list(self.policy.get_actor_parameters())
             critic_params = list(self.policy.get_critic_parameters())
 
-            # Actor PPO, entropy, and optional symmetry loss accumulate first.
-            (surrogate_loss + actor_auxiliary_loss).backward()
+            actor_amtl_grad_norm = 0.0
+            actor_raw_mean_cosine = 0.0
+            actor_raw_min_cosine = 0.0
+            actor_raw_max_cosine = 0.0
+            actor_raw_conflict_fraction = 0.0
+            actor_aligned_mean_cosine = 0.0
+            actor_aligned_min_cosine = 0.0
+            actor_aligned_max_cosine = 0.0
+            actor_aligned_conflict_fraction = 0.0
+            actor_alignment_mean_cosine = 0.0
+            actor_amtl_vs_ppo_cosine = 0.0
+            actor_amtl_projection_on_ppo = 0.0
+            actor_amtl_projection_ratio = 0.0
+            actor_amtl_parallel_norm = 0.0
+            actor_amtl_orthogonal_norm = 0.0
+            actor_amtl_orthogonal_ratio = 0.0
+            actor_objective_vs_ppo_cosine_min = 0.0
+            actor_objective_vs_ppo_cosine_max = 0.0
+            actor_objective_vs_ppo_cosine_mean = 0.0
+            actor_amtl_vs_objective_cosine_min = 0.0
+            actor_amtl_vs_objective_cosine_max = 0.0
+            actor_amtl_vs_objective_cosine_mean = 0.0
+            actor_objective_vs_ppo_cosines: torch.Tensor | None = None
+            actor_amtl_vs_objective_cosines: torch.Tensor | None = None
+            actor_scale = 0.0
+            num_actor_objectives = 1
+
+            if self.use_actor_amtl:
+                if surrogate_losses_by_term is None:
+                    raise ValueError("Actor-only AMTL requires per-objective advantages, but none were provided.")
+
+                standard_actor_grad_list = torch.autograd.grad(
+                    surrogate_loss, actor_params, retain_graph=True, allow_unused=True
+                )
+                standard_actor_grad = self._flatten_grad_list(standard_actor_grad_list, actor_params)
+                actor_grads = []
+                num_actor_objectives = len(surrogate_losses_by_term)
+                for loss in surrogate_losses_by_term:
+                    self._zero_existing_grads(actor_params)
+                    loss.backward(retain_graph=True)
+                    actor_grads.append(self._collect_flat_grad(actor_params))
+
+                self._zero_existing_grads(actor_params)
+                stacked_actor_grads = torch.stack(actor_grads, dim=0)
+                raw_actor_cosine_stats = self._pairwise_cosine_stats(stacked_actor_grads)
+                aligned_actor_grads, _, _ = ProcrustesSolver.apply(stacked_actor_grads.T.unsqueeze(0))
+                aligned_actor_grad_matrix = aligned_actor_grads[0].T
+                aligned_actor_cosine_stats = self._pairwise_cosine_stats(aligned_actor_grad_matrix)
+                aligned_actor_grad = aligned_actor_grads[0].mean(-1)* 4.0
+                standard_actor_grad_norm = standard_actor_grad.norm()
+                aligned_actor_grad_norm = aligned_actor_grad.norm()
+                aligned_vs_ppo_dot = torch.dot(aligned_actor_grad, standard_actor_grad)
+                ppo_unit = (
+                    standard_actor_grad / standard_actor_grad_norm.clamp_min(1.0e-12)
+                    if standard_actor_grad_norm.item() > 1.0e-12
+                    else torch.zeros_like(standard_actor_grad)
+                )
+                parallel_actor_grad = torch.dot(aligned_actor_grad, ppo_unit) * ppo_unit
+                orthogonal_actor_grad = aligned_actor_grad - parallel_actor_grad
+                actor_objective_vs_ppo_cosines = self._cosine_against_reference(
+                    stacked_actor_grads, standard_actor_grad
+                )
+                actor_amtl_vs_objective_cosines = self._cosine_against_reference(
+                    stacked_actor_grads, aligned_actor_grad
+                )
+                actor_amtl_grad_norm = aligned_actor_grad_norm.item()
+                actor_raw_mean_cosine = raw_actor_cosine_stats["mean"]
+                actor_raw_min_cosine = raw_actor_cosine_stats["min"]
+                actor_raw_max_cosine = raw_actor_cosine_stats["max"]
+                actor_raw_conflict_fraction = raw_actor_cosine_stats["conflict_fraction"]
+                actor_aligned_mean_cosine = aligned_actor_cosine_stats["mean"]
+                actor_aligned_min_cosine = aligned_actor_cosine_stats["min"]
+                actor_aligned_max_cosine = aligned_actor_cosine_stats["max"]
+                actor_aligned_conflict_fraction = aligned_actor_cosine_stats["conflict_fraction"]
+                actor_alignment_mean_cosine = actor_aligned_mean_cosine
+                actor_amtl_vs_ppo_cosine = self._safe_cosine_similarity(aligned_actor_grad, standard_actor_grad)
+                actor_amtl_projection_on_ppo = (
+                    aligned_vs_ppo_dot / standard_actor_grad_norm.clamp_min(1.0e-12)
+                ).item()
+                actor_amtl_projection_ratio = (
+                    aligned_vs_ppo_dot / standard_actor_grad_norm.square().clamp_min(1.0e-12)
+                ).item()
+                actor_amtl_parallel_norm = parallel_actor_grad.norm().item()
+                actor_amtl_orthogonal_norm = orthogonal_actor_grad.norm().item()
+                actor_amtl_orthogonal_ratio = (
+                    orthogonal_actor_grad.norm() / aligned_actor_grad_norm.clamp_min(1.0e-12)
+                ).item()
+                actor_objective_vs_ppo_cosine_min = actor_objective_vs_ppo_cosines.min().item()
+                actor_objective_vs_ppo_cosine_max = actor_objective_vs_ppo_cosines.max().item()
+                actor_objective_vs_ppo_cosine_mean = actor_objective_vs_ppo_cosines.mean().item()
+                actor_amtl_vs_objective_cosine_min = actor_amtl_vs_objective_cosines.min().item()
+                actor_amtl_vs_objective_cosine_max = actor_amtl_vs_objective_cosines.max().item()
+                actor_amtl_vs_objective_cosine_mean = actor_amtl_vs_objective_cosines.mean().item()
+                actor_scale = (aligned_actor_grad_norm / (standard_actor_grad.norm() + 1.0e-8)).item()
+                self._print_actor_amtl_diagnostics_once(
+                    stacked_actor_grads,
+                    aligned_actor_grads,
+                    aligned_actor_grad_matrix,
+                    raw_actor_cosine_stats,
+                    aligned_actor_cosine_stats,
+                    actor_amtl_vs_ppo_cosine,
+                    actor_amtl_projection_ratio,
+                    actor_amtl_orthogonal_ratio,
+                    actor_objective_vs_ppo_cosines,
+                    actor_amtl_vs_objective_cosines,
+                    actor_params,
+                    critic_params,
+                )
+                set_shared_grad(actor_params, aligned_actor_grad)
+                actor_auxiliary_loss.backward()
+            else:
+                (surrogate_loss + actor_auxiliary_loss).backward()
 
             critic_grad_norm = 0.0
-            if critic_losses_by_term is not None and self.use_critic_amtl:
-                critic_grads = []
-                for loss_index, loss in enumerate(critic_losses_by_term):
-                    # Isolate each critic head gradient before alignment.
-                    self._zero_existing_grads(critic_params)
-                    retain_graph = loss_index < len(critic_losses_by_term) - 1
-                    (self.value_loss_coef * loss).backward(retain_graph=retain_graph)
-                    critic_grads.append(self._collect_flat_grad(critic_params))
-
-                self._zero_existing_grads(critic_params)
-                critic_grads = torch.stack(critic_grads, dim=0)
-                # After alignment the solver still returns [1, num_parameters, num_heads],
-                # so summing over the last axis produces one flattened critic gradient.
-                aligned_critic_grads, _, _ = ProcrustesSolver.apply(critic_grads.T.unsqueeze(0))
-                aligned_critic_grad = aligned_critic_grads[0].sum(-1)
-                set_shared_grad(critic_params, aligned_critic_grad)
-                critic_grad_norm = aligned_critic_grad.norm().item()
-            else:
-                # Baseline path: plain mean value loss without AMTL alignment.
-                (self.value_loss_coef * value_loss).backward()
-                critic_grad_norm = self._collect_flat_grad(critic_params).norm().item()
+            # Critic AMTL is disabled. Critic training always follows the normal
+            # mean value-loss path, even for a multi-head critic.
+            (self.value_loss_coef * value_loss).backward()
+            critic_grad_norm = self._collect_flat_grad(critic_params).norm().item()
 
             if (
                 self.debug_amtl
@@ -1158,17 +1446,17 @@ class PPO:
                     if critic_losses_by_term is not None
                     else [value_loss.item()]
                 )
-                print("Actor AMTL: OFF (standard PPO clipped surrogate)")
+                print(f"Actor AMTL: {'ON' if self.use_actor_amtl else 'OFF'}")
+                print(f"Actor AMTL objectives: {num_actor_objectives}")
+                print(f"Actor AMTL gradient norm: {actor_amtl_grad_norm}")
+                print(f"Actor alignment mean cosine: {actor_alignment_mean_cosine}")
+                print(f"Actor scale: {actor_scale}")
                 print(f"Critic heads: {value_batch.shape[-1]}")
                 print(f"Critic objectives: {critic_objectives}")
                 print(f"Critic AMTL: {'ON' if self.use_critic_amtl else 'OFF'}")
-                print(
-                    "Critic training: AMTL-aligned per-head MSE"
-                    if self.use_critic_amtl
-                    else "Critic training: normal mean per-head MSE"
-                )
+                print("Critic training: normal mean per-head MSE")
                 print(f"Critic value loss per head: {critic_value_losses}")
-                print(f"Critic AMTL gradient norm: {critic_grad_norm}")
+                print(f"Critic gradient norm: {critic_grad_norm}")
                 debug_logged_this_update = True
 
             if self.rnd:
@@ -1187,7 +1475,41 @@ class PPO:
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
             mean_kl_divergence += kl_mean_value
-            mean_critic_amtl_grad_norm += critic_grad_norm
+            mean_actor_amtl_grad_norm += actor_amtl_grad_norm
+            mean_num_actor_objectives += num_actor_objectives
+            mean_actor_raw_mean_cosine += actor_raw_mean_cosine
+            mean_actor_raw_min_cosine += actor_raw_min_cosine
+            mean_actor_raw_max_cosine += actor_raw_max_cosine
+            mean_actor_raw_conflict_fraction += actor_raw_conflict_fraction
+            mean_actor_aligned_mean_cosine += actor_aligned_mean_cosine
+            mean_actor_aligned_min_cosine += actor_aligned_min_cosine
+            mean_actor_aligned_max_cosine += actor_aligned_max_cosine
+            mean_actor_aligned_conflict_fraction += actor_aligned_conflict_fraction
+            mean_actor_alignment_mean_cosine += actor_alignment_mean_cosine
+            mean_actor_amtl_vs_ppo_cosine += actor_amtl_vs_ppo_cosine
+            mean_actor_amtl_projection_on_ppo += actor_amtl_projection_on_ppo
+            mean_actor_amtl_projection_ratio += actor_amtl_projection_ratio
+            mean_actor_amtl_parallel_norm += actor_amtl_parallel_norm
+            mean_actor_amtl_orthogonal_norm += actor_amtl_orthogonal_norm
+            mean_actor_amtl_orthogonal_ratio += actor_amtl_orthogonal_ratio
+            mean_actor_objective_vs_ppo_cosine_min += actor_objective_vs_ppo_cosine_min
+            mean_actor_objective_vs_ppo_cosine_max += actor_objective_vs_ppo_cosine_max
+            mean_actor_objective_vs_ppo_cosine_mean += actor_objective_vs_ppo_cosine_mean
+            mean_actor_amtl_vs_objective_cosine_min += actor_amtl_vs_objective_cosine_min
+            mean_actor_amtl_vs_objective_cosine_max += actor_amtl_vs_objective_cosine_max
+            mean_actor_amtl_vs_objective_cosine_mean += actor_amtl_vs_objective_cosine_mean
+            mean_actor_scale += actor_scale
+            if actor_objective_vs_ppo_cosines is not None:
+                if actor_objective_vs_ppo_cosine_sums is None:
+                    actor_objective_vs_ppo_cosine_sums = torch.zeros_like(actor_objective_vs_ppo_cosines)
+                actor_objective_vs_ppo_cosine_sums += actor_objective_vs_ppo_cosines.detach()
+            if actor_amtl_vs_objective_cosines is not None:
+                if actor_amtl_vs_objective_cosine_sums is None:
+                    actor_amtl_vs_objective_cosine_sums = torch.zeros_like(actor_amtl_vs_objective_cosines)
+                actor_amtl_vs_objective_cosine_sums += actor_amtl_vs_objective_cosines.detach()
+            if action_entropy_sums is None:
+                action_entropy_sums = torch.zeros_like(action_entropy_batch.mean(dim=0))
+            action_entropy_sums += action_entropy_batch.detach().mean(dim=0)
             if critic_losses_by_term is not None:
                 if critic_value_loss_sums is None:
                     critic_value_loss_sums = torch.zeros_like(critic_losses_by_term)
@@ -1202,7 +1524,30 @@ class PPO:
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
         mean_kl_divergence /= num_updates
-        mean_critic_amtl_grad_norm /= num_updates
+        mean_actor_amtl_grad_norm /= num_updates
+        mean_num_actor_objectives /= num_updates
+        mean_actor_raw_mean_cosine /= num_updates
+        mean_actor_raw_min_cosine /= num_updates
+        mean_actor_raw_max_cosine /= num_updates
+        mean_actor_raw_conflict_fraction /= num_updates
+        mean_actor_aligned_mean_cosine /= num_updates
+        mean_actor_aligned_min_cosine /= num_updates
+        mean_actor_aligned_max_cosine /= num_updates
+        mean_actor_aligned_conflict_fraction /= num_updates
+        mean_actor_alignment_mean_cosine /= num_updates
+        mean_actor_amtl_vs_ppo_cosine /= num_updates
+        mean_actor_amtl_projection_on_ppo /= num_updates
+        mean_actor_amtl_projection_ratio /= num_updates
+        mean_actor_amtl_parallel_norm /= num_updates
+        mean_actor_amtl_orthogonal_norm /= num_updates
+        mean_actor_amtl_orthogonal_ratio /= num_updates
+        mean_actor_objective_vs_ppo_cosine_min /= num_updates
+        mean_actor_objective_vs_ppo_cosine_max /= num_updates
+        mean_actor_objective_vs_ppo_cosine_mean /= num_updates
+        mean_actor_amtl_vs_objective_cosine_min /= num_updates
+        mean_actor_amtl_vs_objective_cosine_max /= num_updates
+        mean_actor_amtl_vs_objective_cosine_mean /= num_updates
+        mean_actor_scale /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
@@ -1216,14 +1561,55 @@ class PPO:
             "actor_ppo_loss": mean_surrogate_loss,
             "entropy": mean_entropy,
             "kl_divergence": mean_kl_divergence,
+            "actor_amtl_grad_norm": mean_actor_amtl_grad_norm,
             "critic_amtl_grad_norm": mean_critic_amtl_grad_norm,
+            "num_actor_objectives": mean_num_actor_objectives,
+            "actor_raw_mean_cosine": mean_actor_raw_mean_cosine,
+            "actor_raw_min_cosine": mean_actor_raw_min_cosine,
+            "actor_raw_max_cosine": mean_actor_raw_max_cosine,
+            "actor_raw_conflict_fraction": mean_actor_raw_conflict_fraction,
+            "actor_aligned_mean_cosine": mean_actor_aligned_mean_cosine,
+            "actor_aligned_min_cosine": mean_actor_aligned_min_cosine,
+            "actor_aligned_max_cosine": mean_actor_aligned_max_cosine,
+            "actor_aligned_conflict_fraction": mean_actor_aligned_conflict_fraction,
+            "actor_alignment_mean_cosine": mean_actor_alignment_mean_cosine,
+            "actor_amtl_vs_ppo_cosine": mean_actor_amtl_vs_ppo_cosine,
+            "actor_amtl_projection_on_ppo": mean_actor_amtl_projection_on_ppo,
+            "actor_amtl_projection_ratio": mean_actor_amtl_projection_ratio,
+            "actor_amtl_parallel_norm": mean_actor_amtl_parallel_norm,
+            "actor_amtl_orthogonal_norm": mean_actor_amtl_orthogonal_norm,
+            "actor_amtl_orthogonal_ratio": mean_actor_amtl_orthogonal_ratio,
+            "actor_objective_vs_ppo_cosine_min": mean_actor_objective_vs_ppo_cosine_min,
+            "actor_objective_vs_ppo_cosine_max": mean_actor_objective_vs_ppo_cosine_max,
+            "actor_objective_vs_ppo_cosine_mean": mean_actor_objective_vs_ppo_cosine_mean,
+            "actor_amtl_vs_objective_cosine_min": mean_actor_amtl_vs_objective_cosine_min,
+            "actor_amtl_vs_objective_cosine_max": mean_actor_amtl_vs_objective_cosine_max,
+            "actor_amtl_vs_objective_cosine_mean": mean_actor_amtl_vs_objective_cosine_mean,
+            "actor_scale": mean_actor_scale,
             "actor_amtl_enabled": 1.0 if self.use_actor_amtl else 0.0,
             "critic_amtl_enabled": 1.0 if self.use_critic_amtl else 0.0,
         }
+        if actor_objective_vs_ppo_cosine_sums is not None:
+            objective_names = self._get_actor_objective_names(len(actor_objective_vs_ppo_cosine_sums))
+            for objective_name, cosine_value in zip(
+                objective_names, actor_objective_vs_ppo_cosine_sums / num_updates, strict=True
+            ):
+                loss_dict[f"actor_objective_vs_ppo_cosine/{objective_name}"] = cosine_value.item()
+        if actor_amtl_vs_objective_cosine_sums is not None:
+            objective_names = self._get_actor_objective_names(len(actor_amtl_vs_objective_cosine_sums))
+            for objective_name, cosine_value in zip(
+                objective_names, actor_amtl_vs_objective_cosine_sums / num_updates, strict=True
+            ):
+                loss_dict[f"actor_amtl_vs_objective_cosine/{objective_name}"] = cosine_value.item()
         if critic_value_loss_sums is not None:
             critic_head_names = self._get_critic_head_names(len(critic_value_loss_sums))
             for head_name, head_loss in zip(critic_head_names, critic_value_loss_sums / num_updates, strict=True):
                 loss_dict[f"critic_value_loss/{head_name}"] = head_loss.item()
+        if action_entropy_sums is not None:
+            num_actions = len(action_entropy_sums)
+            digits = max(2, len(str(num_actions - 1)))
+            for action_index, entropy_value in enumerate(action_entropy_sums / num_updates):
+                loss_dict[f"Policy/action_entropy/action_{action_index:0{digits}d}"] = entropy_value.item()
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:

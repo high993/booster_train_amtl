@@ -26,7 +26,14 @@ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
-parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
+parser.add_argument(
+    "--num_envs",
+    "--num_env",
+    dest="num_envs",
+    type=int,
+    default=None,
+    help="Number of environments to simulate.",
+)
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
@@ -41,7 +48,23 @@ parser.add_argument("--export_io_descriptors", action="store_true", default=Fals
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
-args_cli, hydra_args = parser.parse_known_args()
+
+
+def _normalize_argv(argv: list[str]) -> list[str]:
+    normalized_argv: list[str] = []
+    for token in argv:
+        if token in {"num_envs", "num_env"}:
+            normalized_argv.append("--num_envs")
+        elif token.startswith("num_envs="):
+            normalized_argv.append("--num_envs=" + token.split("=", 1)[1])
+        elif token.startswith("num_env="):
+            normalized_argv.append("--num_envs=" + token.split("=", 1)[1])
+        else:
+            normalized_argv.append(token)
+    return normalized_argv
+
+
+args_cli, hydra_args = parser.parse_known_args(_normalize_argv(sys.argv[1:]))
 
 # always enable cameras to record video
 if args_cli.video:

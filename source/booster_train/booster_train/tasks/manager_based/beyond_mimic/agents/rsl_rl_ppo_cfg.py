@@ -4,7 +4,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 @configclass
 class AmtlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
-    amtl_apply_to: str = "critic"
+    amtl_apply_to: str = "actor"
     debug_amtl: bool = False
     debug_amtl_log_interval: int = 100
 
@@ -39,7 +39,7 @@ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,
-        amtl_apply_to="critic",
+        amtl_apply_to="actor",
         debug_amtl=False,
         debug_amtl_log_interval=100,
     )

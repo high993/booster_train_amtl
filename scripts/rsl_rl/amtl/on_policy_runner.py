@@ -74,6 +74,14 @@ class OnPolicyRunner:
             return obs[0]
         return obs
 
+    @staticmethod
+    def _is_direct_log_key(key: str) -> bool:
+        return key.startswith(("Policy/", "Loss/", "Perf/", "Train/", "Episode/", "Rnd/"))
+
+    @classmethod
+    def _writer_key_for_loss_metric(cls, key: str) -> str:
+        return key if cls._is_direct_log_key(key) else f"Loss/{key}"
+
     def _summarize_episode_infos(self, ep_infos: list[dict]) -> dict[str, float]:
         summary: dict[str, float] = {}
         if not ep_infos:
@@ -321,7 +329,7 @@ class OnPolicyRunner:
 
         # Log losses
         for key, value in locs["loss_dict"].items():
-            self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
+            self.writer.add_scalar(self._writer_key_for_loss_metric(key), value, locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
 
         # Log noise std
@@ -360,6 +368,8 @@ class OnPolicyRunner:
             )
             # Print losses
             for key, value in locs["loss_dict"].items():
+                if self._is_direct_log_key(key):
+                    continue
                 log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
             # Print rewards
             if hasattr(self.alg, "rnd") and self.alg.rnd:
@@ -379,6 +389,8 @@ class OnPolicyRunner:
                 f"""{"Mean action noise std:":>{pad}} {mean_std.item():.2f}\n"""
             )
             for key, value in locs["loss_dict"].items():
+                if self._is_direct_log_key(key):
+                    continue
                 log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
 
         log_string += ep_string
