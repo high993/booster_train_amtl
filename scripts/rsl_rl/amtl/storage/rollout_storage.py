@@ -203,7 +203,12 @@ class RolloutStorage:
         # Normalize the advantages if flag is set
         # Note: This is to prevent double normalization (i.e. if per minibatch normalization is used)
         if normalize_advantage:
-            self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
+            # Use the summed scalar advantage scale for both scalar PPO and
+            # every per-term AMTL advantage. A shared scale preserves the
+            # configured relative reward magnitudes, while independently
+            # standardizing each term would make every objective unit variance.
+            scalar_advantage_std = self.advantages.std() + 1e-8
+            self.advantages = (self.advantages - self.advantages.mean()) / scalar_advantage_std
 
 
         # Adv by each individual term (no grouping)
@@ -232,8 +237,7 @@ class RolloutStorage:
             self.advantages_by_term = self.returns_by_term - critic_values
             if normalize_advantage:
                 mean = self.advantages_by_term.mean(dim=(0, 1), keepdim=True)
-                std = self.advantages_by_term.std(dim=(0, 1), keepdim=True)
-                self.advantages_by_term = (self.advantages_by_term - mean) / (std + 1e-8)
+                self.advantages_by_term = (self.advantages_by_term - mean) / scalar_advantage_std
 
     # For distillation
     def generator(self) -> Generator:

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -79,6 +80,162 @@ class ProcrustesSolver:
             return grads, weights, singulars
 
 
+class PGASolver:
+    """Principal Gradient Alignment aggregation for objective gradients.
+
+    ``grads`` is a parameter-by-objective matrix.  The returned aggregate is a
+    single gradient in parameter space, ready to be installed with
+    :func:`set_shared_grad` before the optimizer step.
+    """
+
+    @staticmethod
+    def apply(
+        grads: torch.Tensor,
+        rank: int | None = None,
+        method: str = "os_nmf",
+        max_iterations: int = 10,
+        tolerance: float = 1e-6,
+        direction_weighting: str = "uniform",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build one aggregate gradient from several objective gradients.
+
+        Args:
+            grads: ``[parameters, objectives]`` or ``[1, parameters,
+                objectives]``. Each column is the gradient of one objective.
+            rank: Number of principal directions to retain. ``None`` keeps all
+                numerically useful directions.
+            method: One of ``"gram"``, ``"procrustes"``, or ``"os_nmf"``.
+            max_iterations: Factorization iterations for ``"procrustes"`` and
+                ``"os_nmf"``.
+            tolerance: Relative factorization convergence tolerance.
+            direction_weighting: ``"uniform"`` gives every retained basis
+                direction equal weight. ``"factor_strength"`` weights each
+                direction by its singular/factor strength.
+        """
+        if grads.ndim == 2:
+            gradient_matrix = grads
+            restore_singleton_dim = False
+        elif grads.ndim == 3 and grads.shape[0] == 1:
+            gradient_matrix = grads.squeeze(0)
+            restore_singleton_dim = True
+        else:
+            raise ValueError(
+                "grads must have shape [parameters, objectives] or "
+                f"[1, parameters, objectives], got {tuple(grads.shape)}."
+            )
+        if not gradient_matrix.is_floating_point():
+            raise TypeError("grads must have a floating-point dtype.")
+        if gradient_matrix.shape[1] == 0:
+            raise ValueError("grads must contain at least one objective.")
+        if rank is not None and rank <= 0:
+            raise ValueError("rank must be a positive integer or None.")
+        if method not in {"gram", "procrustes", "os_nmf"}:
+            raise ValueError('method must be "gram", "procrustes", or "os_nmf".')
+        if max_iterations <= 0:
+            raise ValueError("max_iterations must be positive.")
+        if tolerance <= 0:
+            raise ValueError("tolerance must be positive.")
+        if direction_weighting not in {"uniform", "factor_strength"}:
+            raise ValueError('direction_weighting must be "uniform" or "factor_strength".')
+
+        with torch.no_grad():
+            num_objectives = gradient_matrix.shape[1]
+            gram = gradient_matrix.T @ gradient_matrix
+            eigenvalues, right_vectors = torch.linalg.eigh(gram)
+            eigenvalues = eigenvalues.clamp_min(0)
+            order = torch.argsort(eigenvalues, descending=True)
+            eigenvalues = eigenvalues[order]
+            right_vectors = right_vectors[:, order]
+
+            eigenvalue_tolerance = (
+                eigenvalues.max() * num_objectives * torch.finfo(eigenvalues.dtype).eps
+            )
+            useful_rank = int(torch.count_nonzero(eigenvalues > eigenvalue_tolerance).item())
+            if rank is not None:
+                useful_rank = min(useful_rank, rank)
+
+            if useful_rank == 0:
+                objective_weights = torch.full(
+                    (num_objectives,),
+                    1.0 / num_objectives,
+                    device=gradient_matrix.device,
+                    dtype=gradient_matrix.dtype,
+                )
+                aggregate_grad = gradient_matrix @ objective_weights
+                singular_values = eigenvalues[:0]
+                principal_weights = right_vectors[:, :0]
+            elif method == "gram":
+                principal_weights = right_vectors[:, :useful_rank]
+                singular_values = torch.sqrt(eigenvalues[:useful_rank])
+                if direction_weighting == "uniform":
+                    direction_weights = torch.full(
+                        (useful_rank,),
+                        1.0 / useful_rank,
+                        device=gradient_matrix.device,
+                        dtype=gradient_matrix.dtype,
+                    )
+                else:
+                    strengths = singular_values.clamp_min(torch.finfo(gradient_matrix.dtype).eps)
+                    direction_weights = strengths / strengths.sum()
+                objective_weights = principal_weights @ (direction_weights / singular_values)
+                aggregate_grad = gradient_matrix @ objective_weights
+            else:
+                singular_values = torch.sqrt(eigenvalues[:useful_rank])
+                basis, factor = PGASolver._factorize(
+                    gradient_matrix, useful_rank, method, max_iterations, tolerance
+                )
+                if direction_weighting == "uniform":
+                    basis_weights = torch.full(
+                        (useful_rank,),
+                        1.0 / useful_rank,
+                        device=gradient_matrix.device,
+                        dtype=gradient_matrix.dtype,
+                    )
+                else:
+                    strengths = torch.linalg.vector_norm(factor, dim=1).clamp_min(
+                        torch.finfo(gradient_matrix.dtype).eps
+                    )
+                    basis_weights = strengths / strengths.sum()
+                target_grad = basis @ basis_weights
+                objective_weights = torch.linalg.pinv(gram) @ (gradient_matrix.T @ target_grad)
+                aggregate_grad = gradient_matrix @ objective_weights
+                principal_weights = factor.T
+
+            if restore_singleton_dim:
+                aggregate_grad = aggregate_grad.unsqueeze(0)
+            return aggregate_grad, objective_weights, singular_values, principal_weights
+
+    @staticmethod
+    def _factorize(
+        grads: torch.Tensor,
+        rank: int,
+        method: str,
+        max_iterations: int,
+        tolerance: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Solve ``min ||G - W H||_F`` with orthogonal ``W`` and optional ``H >= 0``."""
+        _, singular_values, right_vectors_t = torch.linalg.svd(grads, full_matrices=False)
+        factor = singular_values[:rank].unsqueeze(1) * right_vectors_t[:rank]
+        if method == "os_nmf":
+            factor = factor.abs()
+
+        for _ in range(max_iterations):
+            left_vectors, _, right_vectors_t = torch.linalg.svd(
+                grads @ factor.T, full_matrices=False
+            )
+            basis = left_vectors[:, :rank] @ right_vectors_t[:rank]
+            updated_factor = basis.T @ grads
+            if method == "os_nmf":
+                updated_factor = updated_factor.clamp_min(0)
+
+            change = torch.linalg.vector_norm(updated_factor - factor)
+            scale = torch.linalg.vector_norm(factor).clamp_min(torch.finfo(grads.dtype).eps)
+            factor = updated_factor
+            if change <= tolerance * scale:
+                break
+        return basis, factor
+
+
 
 
 
@@ -139,6 +296,10 @@ class PPO:
         env=None,
         normalize_advantage_per_mini_batch: bool = False,
         amtl_apply_to: str = "actor",
+        pga_rank: int | None = None,
+        pga_direction_weighting: str = "uniform",
+        pga_match_ppo_grad_norm: bool = False,
+        min_action_std: float | None = None,
         debug_amtl: bool = False,
         debug_amtl_log_interval: int = 100,
         # RND parameters
@@ -154,14 +315,14 @@ class PPO:
         if legacy_align_actor is not None or legacy_align_critic is not None:
             warnings.warn(
                 "The `align_actor_all_terms` and `align_critic` flags are deprecated. "
-                "Use `amtl_apply_to=\"actor\"` for the actor-only AMTL setup.",
+                "Use `amtl_apply_to=\"actor\"` for actor-side AMTL.",
                 stacklevel=2,
             )
             if legacy_align_actor and amtl_apply_to == "none":
                 amtl_apply_to = "actor"
             if legacy_align_critic:
                 warnings.warn(
-                    "Critic-side AMTL is disabled in this PPO branch. The deprecated `align_critic` flag is ignored.",
+                    "Critic-side AMTL is disabled; the deprecated `align_critic` flag is ignored.",
                     stacklevel=2,
                 )
 
@@ -169,6 +330,8 @@ class PPO:
             raise ValueError(
                 f"Unsupported amtl_apply_to='{amtl_apply_to}'. This branch supports only 'none' and 'actor'."
             )
+        if min_action_std is not None and min_action_std <= 0.0:
+            raise ValueError("min_action_std must be positive or None.")
 
         if legacy_kwargs:
             warnings.warn(
@@ -255,11 +418,13 @@ class PPO:
         self.learning_rate = learning_rate
         self.share_cnn_encoders = share_cnn_encoders
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
-        # This branch only supports actor-side AMTL. The critic always stays on
-        # the standard PPO value-loss path.
         self.amtl_apply_to = amtl_apply_to
         self.use_actor_amtl = amtl_apply_to == "actor"
         self.use_critic_amtl = False
+        self.pga_rank = pga_rank
+        self.pga_direction_weighting = pga_direction_weighting
+        self.pga_match_ppo_grad_norm = pga_match_ppo_grad_norm
+        self.min_action_std = min_action_std
         self.debug_amtl = debug_amtl
         self.debug_amtl_log_interval = debug_amtl_log_interval
         self.update_counter = 0
@@ -323,6 +488,19 @@ class PPO:
         for param in params:
             if param.grad is not None:
                 param.grad.data.zero_()
+
+    def _enforce_min_action_std(self) -> None:
+        """Keep learned state-independent policy noise above its configured floor."""
+        if self.min_action_std is None:
+            return
+        std_param = self.policy.learned_action_std_parameter
+        if std_param is None:
+            return
+        with torch.no_grad():
+            if self.policy.noise_std_type == "scalar":
+                std_param.clamp_(min=self.min_action_std)
+            elif self.policy.noise_std_type == "log":
+                std_param.clamp_(min=math.log(self.min_action_std))
 
     @staticmethod
     def _collect_flat_grad(params: Sequence[torch.nn.Parameter]) -> torch.Tensor:
@@ -434,11 +612,15 @@ class PPO:
         print(f"pairwise_cosine_sanity_test_mean={cosine_stats['mean']}")
         self._pairwise_cosine_sanity_printed = True
 
-    def _print_actor_amtl_diagnostics_once(
+    def _print_amtl_diagnostics_once(
         self,
+        actor_amtl_enabled: bool,
+        critic_amtl_enabled: bool,
+        num_actor_objectives: int,
         stacked_actor_grads: torch.Tensor,
         aligned_actor_grads: torch.Tensor,
         aligned_actor_grad_matrix: torch.Tensor,
+        aligned_actor_grad: torch.Tensor,
         raw_actor_cosine_stats: dict[str, float],
         aligned_actor_cosine_stats: dict[str, float],
         actor_amtl_vs_ppo_cosine: float,
@@ -446,20 +628,37 @@ class PPO:
         actor_amtl_orthogonal_ratio: float,
         objective_vs_ppo_cosines: torch.Tensor,
         amtl_vs_objective_cosines: torch.Tensor,
+        num_critic_objectives: int,
+        stacked_critic_grads: torch.Tensor | None,
+        procrustes_critic_input: torch.Tensor | None,
+        aligned_critic_grad: torch.Tensor | None,
         actor_params: Sequence[torch.nn.Parameter],
         critic_params: Sequence[torch.nn.Parameter],
     ) -> None:
         if self._amtl_diagnostics_printed or self.gpu_global_rank != 0:
             return
         self._print_pairwise_cosine_sanity_once(stacked_actor_grads.device)
+        print(f"actor_amtl_enabled={actor_amtl_enabled}")
+        print(f"num_actor_objectives={num_actor_objectives}")
         print(f"number_of_actor_objectives={stacked_actor_grads.shape[0]}")
         print(f"number_of_actor_gradients={stacked_actor_grads.shape[0]}")
         print(f"stacked_actor_gradient_shape={tuple(stacked_actor_grads.shape)}")
         print(f"stacked_actor_grads.shape={tuple(stacked_actor_grads.shape)}")
         print(f"aligned_actor_grads.shape={tuple(aligned_actor_grads.shape)}")
         print(f"aligned_actor_grad_matrix.shape={tuple(aligned_actor_grad_matrix.shape)}")
+        print(f"aligned_actor_grad.shape={tuple(aligned_actor_grad.shape)}")
         print(f"actor_parameter_count={self._parameter_count(actor_params)}")
+        print("actor_alignment_includes_std/log_std=False")
+        print(f"actor_has_separate_std/log_std={bool(self.policy.get_actor_std_parameters())}")
+        print(f"critic_amtl_enabled={critic_amtl_enabled}")
+        print(f"num_critic_objectives={num_critic_objectives}")
         print(f"critic_parameter_count={self._parameter_count(critic_params)}")
+        if stacked_critic_grads is not None:
+            print(f"stacked_critic_grads.shape={tuple(stacked_critic_grads.shape)}")
+        if procrustes_critic_input is not None:
+            print(f"procrustes_critic_input.shape={tuple(procrustes_critic_input.shape)}")
+        if aligned_critic_grad is not None:
+            print(f"aligned_critic_grad.shape={tuple(aligned_critic_grad.shape)}")
         print(f"actor_raw_mean_cosine={raw_actor_cosine_stats['mean']}")
         print(f"actor_raw_min_cosine={raw_actor_cosine_stats['min']}")
         print(f"actor_raw_max_cosine={raw_actor_cosine_stats['max']}")
@@ -646,11 +845,13 @@ class PPO:
             # Check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+                    scalar_advantage_std = advantages_batch.std() + 1e-8
+                    advantages_batch = (advantages_batch - advantages_batch.mean()) / scalar_advantage_std
                     if advantages_by_term_batch is not None:
                         term_mean = advantages_by_term_batch.mean(dim=0, keepdim=True)
-                        term_std = advantages_by_term_batch.std(dim=0, keepdim=True)
-                        advantages_by_term_batch = (advantages_by_term_batch - term_mean) / (term_std + 1e-8)
+                        advantages_by_term_batch = (
+                            advantages_by_term_batch - term_mean
+                        ) / scalar_advantage_std
 
             # Perform symmetric augmentation
             if self.symmetry and self.symmetry["use_data_augmentation"]:
@@ -1105,10 +1306,10 @@ class PPO:
         return loss_dict
 
     def update(self) -> dict[str, float]:
-        """Actor-only AMTL update.
+        """AMTL-enabled PPO update.
 
-        The actor aligns per-objective PPO surrogate gradients with Procrustes.
-        The critic always uses the standard PPO value-loss path without AMTL.
+        The actor aggregates per-objective PPO surrogate gradients with PGA.
+        The critic always uses the standard mean value-loss gradient.
         """
 
         mean_value_loss = 0.0
@@ -1117,6 +1318,7 @@ class PPO:
         mean_kl_divergence = 0.0
         mean_actor_amtl_grad_norm = 0.0
         mean_num_actor_objectives = 0.0
+        mean_num_critic_objectives = 0.0
         mean_actor_raw_mean_cosine = 0.0
         mean_actor_raw_min_cosine = 0.0
         mean_actor_raw_max_cosine = 0.0
@@ -1144,6 +1346,14 @@ class PPO:
         action_entropy_sums: torch.Tensor | None = None
         actor_objective_vs_ppo_cosine_sums: torch.Tensor | None = None
         actor_amtl_vs_objective_cosine_sums: torch.Tensor | None = None
+        actor_pga_objective_weight_sums: torch.Tensor | None = None
+        actor_pga_objective_contribution_norm_sums: torch.Tensor | None = None
+        actor_pga_objective_projection_sums: torch.Tensor | None = None
+        actor_pga_singular_value_sums: torch.Tensor | None = None
+        actor_pga_energy_sums: torch.Tensor | None = None
+        actor_pga_energy_fraction_sums: torch.Tensor | None = None
+        actor_pga_svd_direction_loading_sums: torch.Tensor | None = None
+        actor_pga_svd_direction_energy_fraction_sums: torch.Tensor | None = None
         mean_rnd_loss = 0.0 if self.rnd else None
         mean_symmetry_loss = 0.0 if self.symmetry else None
 
@@ -1172,11 +1382,13 @@ class PPO:
 
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+                    scalar_advantage_std = advantages_batch.std() + 1e-8
+                    advantages_batch = (advantages_batch - advantages_batch.mean()) / scalar_advantage_std
                     if advantages_by_term_batch is not None:
                         term_mean = advantages_by_term_batch.mean(dim=0, keepdim=True)
-                        term_std = advantages_by_term_batch.std(dim=0, keepdim=True)
-                        advantages_by_term_batch = (advantages_by_term_batch - term_mean) / (term_std + 1e-8)
+                        advantages_by_term_batch = (
+                            advantages_by_term_batch - term_mean
+                        ) / scalar_advantage_std
 
             if self.symmetry and self.symmetry["use_data_augmentation"]:
                 data_augmentation_func = self.symmetry["data_augmentation_func"]
@@ -1268,6 +1480,7 @@ class PPO:
                         -1, value_batch.shape[-1]
                     ).mean(dim=0)
                 value_loss = critic_losses_by_term.mean()
+                num_critic_objectives = len(critic_losses_by_term)
             else:
                 if value_batch.shape[-1] != 1:
                     raise ValueError(
@@ -1312,7 +1525,10 @@ class PPO:
                 rnd_loss = torch.nn.MSELoss()(predicted_embedding, target_embedding)
 
             self.optimizer.zero_grad()
-            actor_params = list(self.policy.get_actor_parameters())
+            # PGA is applied only to the policy-mean network. Exploration std
+            # follows the ordinary scalar PPO surrogate plus entropy.
+            actor_params = list(self.policy.get_actor_mean_parameters())
+            actor_std_params = list(self.policy.get_actor_std_parameters())
             critic_params = list(self.policy.get_critic_parameters())
 
             actor_amtl_grad_norm = 0.0
@@ -1339,8 +1555,32 @@ class PPO:
             actor_amtl_vs_objective_cosine_mean = 0.0
             actor_objective_vs_ppo_cosines: torch.Tensor | None = None
             actor_amtl_vs_objective_cosines: torch.Tensor | None = None
+            actor_pga_objective_weights: torch.Tensor | None = None
+            actor_pga_objective_contribution_norms: torch.Tensor | None = None
+            actor_pga_objective_projections: torch.Tensor | None = None
+            actor_pga_singular_values: torch.Tensor | None = None
+            actor_pga_energies: torch.Tensor | None = None
+            actor_pga_energy_fractions: torch.Tensor | None = None
+            actor_pga_svd_direction_loadings: torch.Tensor | None = None
+            actor_pga_svd_direction_energy_fractions: torch.Tensor | None = None
             actor_scale = 0.0
             num_actor_objectives = 1
+            num_critic_objectives = 1
+            stacked_actor_grads: torch.Tensor | None = None
+            aligned_actor_grads: torch.Tensor | None = None
+            aligned_actor_grad_matrix: torch.Tensor | None = None
+            aligned_actor_grad: torch.Tensor | None = None
+            raw_actor_cosine_stats = {
+                "mean": 0.0,
+                "min": 0.0,
+                "max": 0.0,
+                "conflict_fraction": 0.0,
+                "near_zero_row_count": 0.0,
+            }
+            aligned_actor_cosine_stats = dict(raw_actor_cosine_stats)
+            stacked_critic_grads: torch.Tensor | None = None
+            procrustes_critic_input: torch.Tensor | None = None
+            aligned_critic_grad: torch.Tensor | None = None
 
             if self.use_actor_amtl:
                 if surrogate_losses_by_term is None:
@@ -1353,17 +1593,80 @@ class PPO:
                 actor_grads = []
                 num_actor_objectives = len(surrogate_losses_by_term)
                 for loss in surrogate_losses_by_term:
-                    self._zero_existing_grads(actor_params)
-                    loss.backward(retain_graph=True)
-                    actor_grads.append(self._collect_flat_grad(actor_params))
+                    grad_list = torch.autograd.grad(
+                        loss, actor_params, retain_graph=True, allow_unused=True
+                    )
+                    actor_grads.append(self._flatten_grad_list(grad_list, actor_params))
 
                 self._zero_existing_grads(actor_params)
                 stacked_actor_grads = torch.stack(actor_grads, dim=0)
                 raw_actor_cosine_stats = self._pairwise_cosine_stats(stacked_actor_grads)
-                aligned_actor_grads, _, _ = ProcrustesSolver.apply(stacked_actor_grads.T.unsqueeze(0))
-                aligned_actor_grad_matrix = aligned_actor_grads[0].T
-                aligned_actor_cosine_stats = self._pairwise_cosine_stats(aligned_actor_grad_matrix)
-                aligned_actor_grad = aligned_actor_grads[0].mean(-1)* 4.0
+                # PGA expects columns to be objective gradients. This is the
+                # same gradient layout used in sample_example.txt:
+                # [1, parameters, objectives]. Its aggregate replaces the
+                # actor gradients immediately before the optimizer step.
+                aggregate_grad, actor_pga_objective_weights, singular_values, _ = PGASolver.apply(
+                    stacked_actor_grads.T.unsqueeze(0),
+                    rank=self.pga_rank,
+                    method="os_nmf",
+                    direction_weighting=self.pga_direction_weighting,
+                )
+                aligned_actor_grad = aggregate_grad.squeeze(0)
+                if self.pga_match_ppo_grad_norm:
+                    aligned_norm = aligned_actor_grad.norm()
+                    norm_scale = torch.where(
+                        aligned_norm > 1.0e-12,
+                        standard_actor_grad.norm() / aligned_norm.clamp_min(1.0e-12),
+                        torch.ones_like(aligned_norm),
+                    )
+                    aligned_actor_grad = aligned_actor_grad * norm_scale
+                    actor_pga_objective_weights = actor_pga_objective_weights * norm_scale
+
+                # Singular values are ordered by PGA direction strength. Pad
+                # numerically discarded directions with zeros so every update
+                # logs a stable, one-entry-per-objective spectrum.
+                actor_pga_singular_values = torch.zeros(
+                    num_actor_objectives,
+                    device=singular_values.device,
+                    dtype=singular_values.dtype,
+                )
+                actor_pga_singular_values[: len(singular_values)] = singular_values
+                actor_pga_energies = actor_pga_singular_values.square()
+                actor_pga_energy_fractions = actor_pga_energies / actor_pga_energies.sum().clamp_min(1.0e-12)
+
+                # Decompose each ranked SVD direction into named objectives.
+                # ``right_vectors[:, k]`` is the objective-space loading for
+                # the same direction whose energy is ``singular_values[k]``.
+                # Eigenvector signs are arbitrary, so log absolute loadings
+                # and squared fractions rather than unstable signed values.
+                objective_gram = stacked_actor_grads @ stacked_actor_grads.T
+                _, right_vectors = torch.linalg.eigh(objective_gram)
+                right_vectors = right_vectors.flip(dims=(1,))
+                actor_pga_svd_direction_loadings = right_vectors.abs()
+                actor_pga_svd_direction_energy_fractions = right_vectors.square()
+
+                # PGA returns ``aggregate = sum_i weight_i * gradient_i``.
+                # Log both the magnitude of each addend and its signed share
+                # along the final update direction. The latter sums to one
+                # (up to numerical precision), while a negative value means
+                # that objective is cancelling the final update.
+                weighted_objective_grads = (
+                    stacked_actor_grads * actor_pga_objective_weights.unsqueeze(1)
+                )
+                actor_pga_objective_contribution_norms = torch.linalg.vector_norm(
+                    weighted_objective_grads, dim=1
+                )
+                actor_pga_objective_projections = (
+                    weighted_objective_grads @ aligned_actor_grad
+                ) / aligned_actor_grad.square().sum().clamp_min(1.0e-12)
+
+                # Retain the existing diagnostics interface. PGA produces one
+                # aggregate rather than a transformed gradient per objective,
+                # so its per-objective diagnostic matrix is the original
+                # objective matrix and pairwise statistics are unchanged.
+                aligned_actor_grads = stacked_actor_grads.T.unsqueeze(0)
+                aligned_actor_grad_matrix = stacked_actor_grads
+                aligned_actor_cosine_stats = raw_actor_cosine_stats
                 standard_actor_grad_norm = standard_actor_grad.norm()
                 aligned_actor_grad_norm = aligned_actor_grad.norm()
                 aligned_vs_ppo_dot = torch.dot(aligned_actor_grad, standard_actor_grad)
@@ -1409,30 +1712,66 @@ class PPO:
                 actor_amtl_vs_objective_cosine_max = actor_amtl_vs_objective_cosines.max().item()
                 actor_amtl_vs_objective_cosine_mean = actor_amtl_vs_objective_cosines.mean().item()
                 actor_scale = (aligned_actor_grad_norm / (standard_actor_grad.norm() + 1.0e-8)).item()
-                self._print_actor_amtl_diagnostics_once(
+                set_shared_grad(actor_params, aligned_actor_grad)
+
+                # Do not expose exploration std to the per-objective PGA
+                # solve. Its gradient comes from normal scalar PPO plus the
+                # entropy regularizer (symmetry has no std dependency).
+                if actor_std_params:
+                    std_grad_list = torch.autograd.grad(
+                        surrogate_loss + actor_auxiliary_loss,
+                        actor_std_params,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )
+                    set_shared_grad(
+                        actor_std_params,
+                        self._flatten_grad_list(std_grad_list, actor_std_params),
+                    )
+
+                # Add mean-network auxiliary gradients (for example symmetry)
+                # on top of the aligned PPO gradient. Entropy is independent
+                # of the mean for the state-independent Normal policy.
+                mean_aux_grad_list = torch.autograd.grad(
+                    actor_auxiliary_loss,
+                    actor_params,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                for param, auxiliary_grad in zip(actor_params, mean_aux_grad_list, strict=True):
+                    if auxiliary_grad is not None:
+                        param.grad.add_(auxiliary_grad)
+            else:
+                (surrogate_loss + actor_auxiliary_loss).backward()
+
+            # Critic training always follows the normal mean value-loss path;
+            # gradient alignment is intentionally actor-only.
+            (self.value_loss_coef * value_loss).backward()
+            critic_grad_norm = self._collect_flat_grad(critic_params).norm().item()
+
+            if self.use_actor_amtl and stacked_actor_grads is not None and aligned_actor_grads is not None and aligned_actor_grad_matrix is not None and aligned_actor_grad is not None:
+                self._print_amtl_diagnostics_once(
+                    self.use_actor_amtl,
+                    self.use_critic_amtl,
+                    num_actor_objectives,
                     stacked_actor_grads,
                     aligned_actor_grads,
                     aligned_actor_grad_matrix,
+                    aligned_actor_grad,
                     raw_actor_cosine_stats,
                     aligned_actor_cosine_stats,
                     actor_amtl_vs_ppo_cosine,
                     actor_amtl_projection_ratio,
                     actor_amtl_orthogonal_ratio,
-                    actor_objective_vs_ppo_cosines,
-                    actor_amtl_vs_objective_cosines,
+                    actor_objective_vs_ppo_cosines if actor_objective_vs_ppo_cosines is not None else torch.zeros(1, device=self.device),
+                    actor_amtl_vs_objective_cosines if actor_amtl_vs_objective_cosines is not None else torch.zeros(1, device=self.device),
+                    num_critic_objectives,
+                    stacked_critic_grads,
+                    procrustes_critic_input,
+                    aligned_critic_grad,
                     actor_params,
                     critic_params,
                 )
-                set_shared_grad(actor_params, aligned_actor_grad)
-                actor_auxiliary_loss.backward()
-            else:
-                (surrogate_loss + actor_auxiliary_loss).backward()
-
-            critic_grad_norm = 0.0
-            # Critic AMTL is disabled. Critic training always follows the normal
-            # mean value-loss path, even for a multi-head critic.
-            (self.value_loss_coef * value_loss).backward()
-            critic_grad_norm = self._collect_flat_grad(critic_params).norm().item()
 
             if (
                 self.debug_amtl
@@ -1454,7 +1793,11 @@ class PPO:
                 print(f"Critic heads: {value_batch.shape[-1]}")
                 print(f"Critic objectives: {critic_objectives}")
                 print(f"Critic AMTL: {'ON' if self.use_critic_amtl else 'OFF'}")
-                print("Critic training: normal mean per-head MSE")
+                print(
+                    "Critic training: AMTL-aligned per-head MSE"
+                    if self.use_critic_amtl
+                    else "Critic training: normal mean per-head MSE"
+                )
                 print(f"Critic value loss per head: {critic_value_losses}")
                 print(f"Critic gradient norm: {critic_grad_norm}")
                 debug_logged_this_update = True
@@ -1468,6 +1811,7 @@ class PPO:
 
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            self._enforce_min_action_std()
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
 
@@ -1477,6 +1821,8 @@ class PPO:
             mean_kl_divergence += kl_mean_value
             mean_actor_amtl_grad_norm += actor_amtl_grad_norm
             mean_num_actor_objectives += num_actor_objectives
+            mean_critic_amtl_grad_norm += critic_grad_norm if self.use_critic_amtl else 0.0
+            mean_num_critic_objectives += num_critic_objectives
             mean_actor_raw_mean_cosine += actor_raw_mean_cosine
             mean_actor_raw_min_cosine += actor_raw_min_cosine
             mean_actor_raw_max_cosine += actor_raw_max_cosine
@@ -1507,6 +1853,44 @@ class PPO:
                 if actor_amtl_vs_objective_cosine_sums is None:
                     actor_amtl_vs_objective_cosine_sums = torch.zeros_like(actor_amtl_vs_objective_cosines)
                 actor_amtl_vs_objective_cosine_sums += actor_amtl_vs_objective_cosines.detach()
+            if actor_pga_objective_weights is not None:
+                if actor_pga_objective_weight_sums is None:
+                    actor_pga_objective_weight_sums = torch.zeros_like(actor_pga_objective_weights)
+                actor_pga_objective_weight_sums += actor_pga_objective_weights.detach()
+            if actor_pga_objective_contribution_norms is not None:
+                if actor_pga_objective_contribution_norm_sums is None:
+                    actor_pga_objective_contribution_norm_sums = torch.zeros_like(
+                        actor_pga_objective_contribution_norms
+                    )
+                actor_pga_objective_contribution_norm_sums += actor_pga_objective_contribution_norms.detach()
+            if actor_pga_objective_projections is not None:
+                if actor_pga_objective_projection_sums is None:
+                    actor_pga_objective_projection_sums = torch.zeros_like(actor_pga_objective_projections)
+                actor_pga_objective_projection_sums += actor_pga_objective_projections.detach()
+            if actor_pga_singular_values is not None:
+                if actor_pga_singular_value_sums is None:
+                    actor_pga_singular_value_sums = torch.zeros_like(actor_pga_singular_values)
+                actor_pga_singular_value_sums += actor_pga_singular_values.detach()
+            if actor_pga_energies is not None:
+                if actor_pga_energy_sums is None:
+                    actor_pga_energy_sums = torch.zeros_like(actor_pga_energies)
+                actor_pga_energy_sums += actor_pga_energies.detach()
+            if actor_pga_energy_fractions is not None:
+                if actor_pga_energy_fraction_sums is None:
+                    actor_pga_energy_fraction_sums = torch.zeros_like(actor_pga_energy_fractions)
+                actor_pga_energy_fraction_sums += actor_pga_energy_fractions.detach()
+            if actor_pga_svd_direction_loadings is not None:
+                if actor_pga_svd_direction_loading_sums is None:
+                    actor_pga_svd_direction_loading_sums = torch.zeros_like(actor_pga_svd_direction_loadings)
+                actor_pga_svd_direction_loading_sums += actor_pga_svd_direction_loadings.detach()
+            if actor_pga_svd_direction_energy_fractions is not None:
+                if actor_pga_svd_direction_energy_fraction_sums is None:
+                    actor_pga_svd_direction_energy_fraction_sums = torch.zeros_like(
+                        actor_pga_svd_direction_energy_fractions
+                    )
+                actor_pga_svd_direction_energy_fraction_sums += (
+                    actor_pga_svd_direction_energy_fractions.detach()
+                )
             if action_entropy_sums is None:
                 action_entropy_sums = torch.zeros_like(action_entropy_batch.mean(dim=0))
             action_entropy_sums += action_entropy_batch.detach().mean(dim=0)
@@ -1526,6 +1910,8 @@ class PPO:
         mean_kl_divergence /= num_updates
         mean_actor_amtl_grad_norm /= num_updates
         mean_num_actor_objectives /= num_updates
+        mean_critic_amtl_grad_norm /= num_updates
+        mean_num_critic_objectives /= num_updates
         mean_actor_raw_mean_cosine /= num_updates
         mean_actor_raw_min_cosine /= num_updates
         mean_actor_raw_max_cosine /= num_updates
@@ -1564,6 +1950,7 @@ class PPO:
             "actor_amtl_grad_norm": mean_actor_amtl_grad_norm,
             "critic_amtl_grad_norm": mean_critic_amtl_grad_norm,
             "num_actor_objectives": mean_num_actor_objectives,
+            "num_critic_objectives": mean_num_critic_objectives,
             "actor_raw_mean_cosine": mean_actor_raw_mean_cosine,
             "actor_raw_min_cosine": mean_actor_raw_min_cosine,
             "actor_raw_max_cosine": mean_actor_raw_max_cosine,
@@ -1601,6 +1988,51 @@ class PPO:
                 objective_names, actor_amtl_vs_objective_cosine_sums / num_updates, strict=True
             ):
                 loss_dict[f"actor_amtl_vs_objective_cosine/{objective_name}"] = cosine_value.item()
+        if actor_pga_objective_weight_sums is not None:
+            objective_names = self._get_actor_objective_names(len(actor_pga_objective_weight_sums))
+            for objective_name, weight in zip(
+                objective_names, actor_pga_objective_weight_sums / num_updates, strict=True
+            ):
+                loss_dict[f"actor_pga_objective_weight/{objective_name}"] = weight.item()
+        if actor_pga_objective_contribution_norm_sums is not None:
+            objective_names = self._get_actor_objective_names(len(actor_pga_objective_contribution_norm_sums))
+            for objective_name, contribution_norm in zip(
+                objective_names, actor_pga_objective_contribution_norm_sums / num_updates, strict=True
+            ):
+                loss_dict[f"actor_pga_objective_contribution_norm/{objective_name}"] = contribution_norm.item()
+        if actor_pga_objective_projection_sums is not None:
+            objective_names = self._get_actor_objective_names(len(actor_pga_objective_projection_sums))
+            for objective_name, projection in zip(
+                objective_names, actor_pga_objective_projection_sums / num_updates, strict=True
+            ):
+                loss_dict[f"actor_pga_objective_projection/{objective_name}"] = projection.item()
+        if actor_pga_singular_value_sums is not None:
+            for direction_index, singular_value in enumerate(actor_pga_singular_value_sums / num_updates):
+                loss_dict[f"actor_pga_singular_value/direction_{direction_index:02d}"] = singular_value.item()
+        if actor_pga_energy_sums is not None:
+            for direction_index, energy in enumerate(actor_pga_energy_sums / num_updates):
+                loss_dict[f"actor_pga_energy/direction_{direction_index:02d}"] = energy.item()
+        if actor_pga_energy_fraction_sums is not None:
+            for direction_index, energy_fraction in enumerate(actor_pga_energy_fraction_sums / num_updates):
+                loss_dict[f"actor_pga_energy_fraction/direction_{direction_index:02d}"] = energy_fraction.item()
+        if actor_pga_svd_direction_loading_sums is not None:
+            objective_names = self._get_actor_objective_names(actor_pga_svd_direction_loading_sums.shape[0])
+            mean_loadings = actor_pga_svd_direction_loading_sums / num_updates
+            for direction_index, direction_loadings in enumerate(mean_loadings.T):
+                for objective_name, loading in zip(objective_names, direction_loadings, strict=True):
+                    loss_dict[
+                        f"actor_pga_svd_direction_loading/direction_{direction_index:02d}/{objective_name}"
+                    ] = loading.item()
+        if actor_pga_svd_direction_energy_fraction_sums is not None:
+            objective_names = self._get_actor_objective_names(
+                actor_pga_svd_direction_energy_fraction_sums.shape[0]
+            )
+            mean_energy_fractions = actor_pga_svd_direction_energy_fraction_sums / num_updates
+            for direction_index, direction_fractions in enumerate(mean_energy_fractions.T):
+                for objective_name, energy_fraction in zip(objective_names, direction_fractions, strict=True):
+                    loss_dict[
+                        f"actor_pga_svd_direction_energy_fraction/direction_{direction_index:02d}/{objective_name}"
+                    ] = energy_fraction.item()
         if critic_value_loss_sums is not None:
             critic_head_names = self._get_critic_head_names(len(critic_value_loss_sums))
             for head_name, head_loss in zip(critic_head_names, critic_value_loss_sums / num_updates, strict=True):

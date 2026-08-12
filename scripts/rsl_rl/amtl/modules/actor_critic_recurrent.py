@@ -133,15 +133,27 @@ class ActorCriticRecurrent(nn.Module):
     def entropy(self) -> torch.Tensor:
         return self.distribution.entropy().sum(dim=-1)
 
-    def get_actor_parameters(self) -> tuple[nn.Parameter, ...]:
-        actor_params = tuple(self.memory_a.parameters()) + tuple(self.actor.parameters())
+    @property
+    def learned_action_std_parameter(self) -> nn.Parameter | None:
         if self.state_dependent_std:
-            return actor_params
+            return None
         if self.noise_std_type == "scalar":
-            return actor_params + (self.std,)
+            return self.std
         if self.noise_std_type == "log":
-            return actor_params + (self.log_std,)
-        return actor_params
+            return self.log_std
+        return None
+
+    def get_actor_mean_parameters(self) -> tuple[nn.Parameter, ...]:
+        return tuple(self.memory_a.parameters()) + tuple(self.actor.parameters())
+
+    def get_actor_std_parameters(self) -> tuple[nn.Parameter, ...]:
+        std_param = self.learned_action_std_parameter
+        if std_param is None:
+            return ()
+        return (std_param,)
+
+    def get_actor_parameters(self) -> tuple[nn.Parameter, ...]:
+        return self.get_actor_mean_parameters() + self.get_actor_std_parameters()
 
     def get_critic_parameters(self) -> tuple[nn.Parameter, ...]:
         return tuple(self.memory_c.parameters()) + tuple(self.critic.parameters())
