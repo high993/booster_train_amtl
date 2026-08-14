@@ -6,14 +6,18 @@ from booster_train.tasks.manager_based.beyond_mimic.agents.rsl_rl_ppo_cfg import
 class PPORunnerCfg(BasePPORunnerCfg):
     max_iterations = 50000
     experiment_name = "k1_fight_001"
-    run_name = "actor_amtl_stronger_critic_vcoef2_epochs8"
+    run_name = "actor_amtl_rank12_sqrt_strength_ppo70_shared_adv"
 
     def __post_init__(self):
         super().__post_init__()
         self.algorithm.amtl_apply_to = "actor"
-        self.algorithm.pga_rank = 16
-        self.algorithm.pga_direction_weighting = "factor_strength"
+        self.algorithm.pga_rank = 12
+        self.algorithm.pga_direction_weighting = "sqrt_strength"
         self.algorithm.pga_match_ppo_grad_norm = True
+        self.algorithm.pga_max_iterations = 50
+        self.algorithm.pga_tolerance = 1.0e-6
+        self.algorithm.pga_relative_singular_cutoff = 0.005
+        self.algorithm.pga_ppo_blend = 0.7
         self.algorithm.min_action_std = 0.2
         self.algorithm.entropy_coef = 0.005
         self.algorithm.value_loss_coef = 2.0

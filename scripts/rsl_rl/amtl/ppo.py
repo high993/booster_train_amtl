@@ -89,6 +89,26 @@ class PGASolver:
     """
 
     @staticmethod
+    def _symmetric_eigh(matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute a symmetric eigendecomposition with a robust CPU fallback."""
+        symmetric_matrix = 0.5 * (matrix + matrix.T)
+        if not torch.isfinite(symmetric_matrix).all():
+            raise ValueError("PGA Gram matrix contains non-finite values.")
+
+        try:
+            return torch.linalg.eigh(symmetric_matrix)
+        except RuntimeError:
+            # Gram matrices are objective-by-objective (small), so retrying in
+            # float64 on the CPU is inexpensive and avoids CUDA eigh failures
+            # on ill-conditioned or nearly repeated spectra.
+            cpu_matrix = symmetric_matrix.detach().to(device="cpu", dtype=torch.float64)
+            eigenvalues, eigenvectors = torch.linalg.eigh(cpu_matrix)
+            return (
+                eigenvalues.to(device=matrix.device, dtype=matrix.dtype),
+                eigenvectors.to(device=matrix.device, dtype=matrix.dtype),
+            )
+
+    @staticmethod
     def apply(
         grads: torch.Tensor,
         rank: int | None = None,
@@ -96,6 +116,7 @@ class PGASolver:
         max_iterations: int = 10,
         tolerance: float = 1e-6,
         direction_weighting: str = "uniform",
+        relative_singular_cutoff: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build one aggregate gradient from several objective gradients.
 
@@ -109,8 +130,11 @@ class PGASolver:
                 ``"os_nmf"``.
             tolerance: Relative factorization convergence tolerance.
             direction_weighting: ``"uniform"`` gives every retained basis
-                direction equal weight. ``"factor_strength"`` weights each
-                direction by its singular/factor strength.
+                direction equal weight. ``"sqrt_strength"`` uses the square
+                root of each direction's strength, and ``"factor_strength"``
+                uses its full singular/factor strength.
+            relative_singular_cutoff: Discard directions whose singular value
+                is below this fraction of the strongest singular value.
         """
         if grads.ndim == 2:
             gradient_matrix = grads
@@ -135,13 +159,17 @@ class PGASolver:
             raise ValueError("max_iterations must be positive.")
         if tolerance <= 0:
             raise ValueError("tolerance must be positive.")
-        if direction_weighting not in {"uniform", "factor_strength"}:
-            raise ValueError('direction_weighting must be "uniform" or "factor_strength".')
+        if direction_weighting not in {"uniform", "sqrt_strength", "factor_strength"}:
+            raise ValueError(
+                'direction_weighting must be "uniform", "sqrt_strength", or "factor_strength".'
+            )
+        if not 0.0 <= relative_singular_cutoff < 1.0:
+            raise ValueError("relative_singular_cutoff must be in [0, 1).")
 
         with torch.no_grad():
             num_objectives = gradient_matrix.shape[1]
             gram = gradient_matrix.T @ gradient_matrix
-            eigenvalues, right_vectors = torch.linalg.eigh(gram)
+            eigenvalues, right_vectors = PGASolver._symmetric_eigh(gram)
             eigenvalues = eigenvalues.clamp_min(0)
             order = torch.argsort(eigenvalues, descending=True)
             eigenvalues = eigenvalues[order]
@@ -150,7 +178,12 @@ class PGASolver:
             eigenvalue_tolerance = (
                 eigenvalues.max() * num_objectives * torch.finfo(eigenvalues.dtype).eps
             )
-            useful_rank = int(torch.count_nonzero(eigenvalues > eigenvalue_tolerance).item())
+            singular_spectrum = torch.sqrt(eigenvalues)
+            relative_tolerance = singular_spectrum[0] * relative_singular_cutoff
+            useful_directions = (eigenvalues > eigenvalue_tolerance) & (
+                singular_spectrum >= relative_tolerance
+            )
+            useful_rank = int(torch.count_nonzero(useful_directions).item())
             if rank is not None:
                 useful_rank = min(useful_rank, rank)
 
@@ -166,44 +199,47 @@ class PGASolver:
                 principal_weights = right_vectors[:, :0]
             elif method == "gram":
                 principal_weights = right_vectors[:, :useful_rank]
-                singular_values = torch.sqrt(eigenvalues[:useful_rank])
-                if direction_weighting == "uniform":
-                    direction_weights = torch.full(
-                        (useful_rank,),
-                        1.0 / useful_rank,
-                        device=gradient_matrix.device,
-                        dtype=gradient_matrix.dtype,
-                    )
-                else:
-                    strengths = singular_values.clamp_min(torch.finfo(gradient_matrix.dtype).eps)
-                    direction_weights = strengths / strengths.sum()
+                singular_values = singular_spectrum[:useful_rank]
+                direction_weights = PGASolver._direction_weights(
+                    singular_values, direction_weighting
+                )
+                basis = gradient_matrix @ (principal_weights / singular_values.unsqueeze(0))
+                aggregate_grad = basis @ direction_weights
                 objective_weights = principal_weights @ (direction_weights / singular_values)
-                aggregate_grad = gradient_matrix @ objective_weights
             else:
-                singular_values = torch.sqrt(eigenvalues[:useful_rank])
+                singular_values = singular_spectrum[:useful_rank]
                 basis, factor = PGASolver._factorize(
                     gradient_matrix, useful_rank, method, max_iterations, tolerance
                 )
-                if direction_weighting == "uniform":
-                    basis_weights = torch.full(
-                        (useful_rank,),
-                        1.0 / useful_rank,
-                        device=gradient_matrix.device,
-                        dtype=gradient_matrix.dtype,
-                    )
-                else:
-                    strengths = torch.linalg.vector_norm(factor, dim=1).clamp_min(
-                        torch.finfo(gradient_matrix.dtype).eps
-                    )
-                    basis_weights = strengths / strengths.sum()
-                target_grad = basis @ basis_weights
-                objective_weights = torch.linalg.pinv(gram) @ (gradient_matrix.T @ target_grad)
-                aggregate_grad = gradient_matrix @ objective_weights
+                strengths = torch.linalg.vector_norm(factor, dim=1)
+                basis_weights = PGASolver._direction_weights(strengths, direction_weighting)
+
+                # Use the basis target directly for training. Recovering
+                # objective coefficients through a pseudoinverse can magnify
+                # weak directions; these coefficients are diagnostics only.
+                aggregate_grad = basis @ basis_weights
+                retained_vectors = right_vectors[:, :useful_rank]
+                retained_eigenvalues = eigenvalues[:useful_rank]
+                gram_rhs = gradient_matrix.T @ aggregate_grad
+                objective_weights = retained_vectors @ (
+                    (retained_vectors.T @ gram_rhs) / retained_eigenvalues
+                )
                 principal_weights = factor.T
 
             if restore_singleton_dim:
                 aggregate_grad = aggregate_grad.unsqueeze(0)
             return aggregate_grad, objective_weights, singular_values, principal_weights
+
+    @staticmethod
+    def _direction_weights(strengths: torch.Tensor, weighting: str) -> torch.Tensor:
+        """Turn retained direction strengths into normalized aggregation weights."""
+        if weighting == "uniform":
+            return torch.full_like(strengths, 1.0 / strengths.numel())
+
+        safe_strengths = strengths.clamp_min(torch.finfo(strengths.dtype).eps)
+        if weighting == "sqrt_strength":
+            safe_strengths = torch.sqrt(safe_strengths)
+        return safe_strengths / safe_strengths.sum()
 
     @staticmethod
     def _factorize(
@@ -299,6 +335,10 @@ class PPO:
         pga_rank: int | None = None,
         pga_direction_weighting: str = "uniform",
         pga_match_ppo_grad_norm: bool = False,
+        pga_max_iterations: int = 10,
+        pga_tolerance: float = 1e-6,
+        pga_relative_singular_cutoff: float = 0.0,
+        pga_ppo_blend: float = 0.0,
         min_action_std: float | None = None,
         debug_amtl: bool = False,
         debug_amtl_log_interval: int = 100,
@@ -332,6 +372,14 @@ class PPO:
             )
         if min_action_std is not None and min_action_std <= 0.0:
             raise ValueError("min_action_std must be positive or None.")
+        if pga_max_iterations <= 0:
+            raise ValueError("pga_max_iterations must be positive.")
+        if pga_tolerance <= 0.0:
+            raise ValueError("pga_tolerance must be positive.")
+        if not 0.0 <= pga_relative_singular_cutoff < 1.0:
+            raise ValueError("pga_relative_singular_cutoff must be in [0, 1).")
+        if not 0.0 <= pga_ppo_blend <= 1.0:
+            raise ValueError("pga_ppo_blend must be in [0, 1].")
 
         if legacy_kwargs:
             warnings.warn(
@@ -424,6 +472,10 @@ class PPO:
         self.pga_rank = pga_rank
         self.pga_direction_weighting = pga_direction_weighting
         self.pga_match_ppo_grad_norm = pga_match_ppo_grad_norm
+        self.pga_max_iterations = pga_max_iterations
+        self.pga_tolerance = pga_tolerance
+        self.pga_relative_singular_cutoff = pga_relative_singular_cutoff
+        self.pga_ppo_blend = pga_ppo_blend
         self.min_action_std = min_action_std
         self.debug_amtl = debug_amtl
         self.debug_amtl_log_interval = debug_amtl_log_interval
@@ -1609,7 +1661,10 @@ class PPO:
                     stacked_actor_grads.T.unsqueeze(0),
                     rank=self.pga_rank,
                     method="os_nmf",
+                    max_iterations=self.pga_max_iterations,
+                    tolerance=self.pga_tolerance,
                     direction_weighting=self.pga_direction_weighting,
+                    relative_singular_cutoff=self.pga_relative_singular_cutoff,
                 )
                 aligned_actor_grad = aggregate_grad.squeeze(0)
                 if self.pga_match_ppo_grad_norm:
@@ -1621,6 +1676,21 @@ class PPO:
                     )
                     aligned_actor_grad = aligned_actor_grad * norm_scale
                     actor_pga_objective_weights = actor_pga_objective_weights * norm_scale
+
+                if self.pga_ppo_blend > 0.0:
+                    aligned_actor_grad = (
+                        self.pga_ppo_blend * standard_actor_grad
+                        + (1.0 - self.pga_ppo_blend) * aligned_actor_grad
+                    )
+                    # The scalar surrogate is the mean of the objective
+                    # surrogates, so its exact coefficient is 1 / objectives.
+                    ppo_objective_weights = torch.full_like(
+                        actor_pga_objective_weights, 1.0 / num_actor_objectives
+                    )
+                    actor_pga_objective_weights = (
+                        self.pga_ppo_blend * ppo_objective_weights
+                        + (1.0 - self.pga_ppo_blend) * actor_pga_objective_weights
+                    )
 
                 # Singular values are ordered by PGA direction strength. Pad
                 # numerically discarded directions with zeros so every update
@@ -1640,7 +1710,7 @@ class PPO:
                 # Eigenvector signs are arbitrary, so log absolute loadings
                 # and squared fractions rather than unstable signed values.
                 objective_gram = stacked_actor_grads @ stacked_actor_grads.T
-                _, right_vectors = torch.linalg.eigh(objective_gram)
+                _, right_vectors = PGASolver._symmetric_eigh(objective_gram)
                 right_vectors = right_vectors.flip(dims=(1,))
                 actor_pga_svd_direction_loadings = right_vectors.abs()
                 actor_pga_svd_direction_energy_fractions = right_vectors.square()

@@ -8,6 +8,10 @@ class AmtlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     pga_rank: int | None = None
     pga_direction_weighting: str = "uniform"
     pga_match_ppo_grad_norm: bool = False
+    pga_max_iterations: int = 10
+    pga_tolerance: float = 1.0e-6
+    pga_relative_singular_cutoff: float = 0.0
+    pga_ppo_blend: float = 0.0
     min_action_std: float | None = None
     debug_amtl: bool = False
     debug_amtl_log_interval: int = 100
@@ -47,6 +51,10 @@ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         pga_rank=None,
         pga_direction_weighting="uniform",
         pga_match_ppo_grad_norm=False,
+        pga_max_iterations=10,
+        pga_tolerance=1.0e-6,
+        pga_relative_singular_cutoff=0.0,
+        pga_ppo_blend=0.0,
         min_action_std=None,
         debug_amtl=False,
         debug_amtl_log_interval=100,
