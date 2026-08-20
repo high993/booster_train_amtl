@@ -11,6 +11,7 @@ class PPORunnerCfg(BasePPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
         self.algorithm.amtl_apply_to = "actor"
+        self.algorithm.actor_pga_mode = "flat"
         self.algorithm.pga_rank = 16
         self.algorithm.pga_direction_weighting = "factor_strength"
         self.algorithm.pga_match_ppo_grad_norm = True

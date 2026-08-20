@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 import math
+import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import warnings
 from collections.abc import Sequence
+from dataclasses import dataclass
 from itertools import chain
 from tensordict import TensorDict
 
@@ -20,6 +22,106 @@ from amtl.storage import RolloutStorage
 from amtl.utils import resolve_optimizer, string_to_callable
 
 from amtl.actor_critic import ActorCritic
+
+
+HIERARCHICAL_5_PGA_GROUPS = (
+    (
+        "G1_global_root_trunk_pose",
+        (
+            "motion_global_anchor_pos",
+            "motion_global_anchor_ori",
+            "motion_trunk_pos",
+            "motion_trunk_ori",
+        ),
+        4.0 / 16.0,
+    ),
+    (
+        "G2_whole_body_pose",
+        ("motion_body_pos", "motion_body_ori"),
+        2.0 / 16.0,
+    ),
+    (
+        "G3_velocity_dynamics",
+        ("motion_body_lin_vel", "motion_body_ang_vel", "motion_trunk_ang_vel"),
+        3.0 / 16.0,
+    ),
+    (
+        "G4_end_effectors",
+        ("motion_foot_pos", "motion_foot_ori", "motion_hand_pos", "motion_hand_ori"),
+        4.0 / 16.0,
+    ),
+    (
+        "G5_regularizers",
+        ("action_rate_l2", "joint_limit", "undesired_contacts"),
+        3.0 / 16.0,
+    ),
+)
+HIERARCHICAL_5_PGA_OBJECTIVE_COUNT = 16
+
+
+def _format_numeric_tensor(tensor: torch.Tensor) -> str:
+    """Return compact tensor statistics that remain useful for NaN/Inf failures."""
+    try:
+        value = tensor.detach()
+        finite_mask = torch.isfinite(value)
+        finite_count = int(finite_mask.sum().item())
+        total_count = value.numel()
+        nan_count = int(torch.isnan(value).sum().item())
+        posinf_count = int(torch.isposinf(value).sum().item())
+        neginf_count = int(torch.isneginf(value).sum().item())
+        if finite_count:
+            finite_values = value[finite_mask]
+            finite_min = float(finite_values.min().item())
+            finite_max = float(finite_values.max().item())
+            finite_abs_max = float(finite_values.abs().max().item())
+        else:
+            finite_min = float("nan")
+            finite_max = float("nan")
+            finite_abs_max = float("nan")
+        details = (
+            f"shape={tuple(value.shape)} dtype={value.dtype} device={value.device} "
+            f"finite={finite_count}/{total_count} nan={nan_count} "
+            f"+inf={posinf_count} -inf={neginf_count} "
+            f"finite_min={finite_min:.9e} finite_max={finite_max:.9e} "
+            f"finite_abs_max={finite_abs_max:.9e}"
+        )
+        if total_count <= 32:
+            details += f" values={value.cpu().tolist()}"
+        return details
+    except Exception as exc:
+        return f"statistics unavailable after CUDA failure: {type(exc).__name__}: {exc}"
+
+
+def _raise_numeric_error(
+    stage: str,
+    tensors: dict[str, torch.Tensor],
+    *,
+    context: str = "",
+    cause: Exception | None = None,
+) -> None:
+    """Print numerical evidence immediately, then stop before state is corrupted."""
+    header = f"[NUMERIC ERROR] stage={stage}"
+    if context:
+        header += f" context={context}"
+    print("\n" + "=" * 96, file=sys.stderr, flush=True)
+    print(header, file=sys.stderr, flush=True)
+    if cause is not None:
+        print(
+            f"cause={type(cause).__name__}: {cause}",
+            file=sys.stderr,
+            flush=True,
+        )
+    for name, tensor in tensors.items():
+        print(
+            f"{name}: {_format_numeric_tensor(tensor)}",
+            file=sys.stderr,
+            flush=True,
+        )
+    print("=" * 96 + "\n", file=sys.stderr, flush=True)
+    error = FloatingPointError(f"Non-finite or invalid numeric state at {stage} ({context})")
+    if cause is not None:
+        raise error from cause
+    raise error
 
 
 def set_shared_grad(shared_params, grad_vec):
@@ -93,9 +195,11 @@ class PGASolver:
         grads: torch.Tensor,
         rank: int | None = None,
         method: str = "os_nmf",
-        max_iterations: int = 10,
+        max_iterations: int = 50,
         tolerance: float = 1e-6,
         direction_weighting: str = "uniform",
+        diagnostic_context: str = "",
+        objective_names: Sequence[str] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build one aggregate gradient from several objective gradients.
 
@@ -137,11 +241,50 @@ class PGASolver:
             raise ValueError("tolerance must be positive.")
         if direction_weighting not in {"uniform", "factor_strength"}:
             raise ValueError('direction_weighting must be "uniform" or "factor_strength".')
+        if objective_names is not None and len(objective_names) != gradient_matrix.shape[1]:
+            raise ValueError(
+                "objective_names must have one entry per gradient column, got "
+                f"{len(objective_names)} names for {gradient_matrix.shape[1]} columns."
+            )
+
+        def failure_tensors(**tensors: torch.Tensor) -> dict[str, torch.Tensor]:
+            details = dict(tensors)
+            details.setdefault("gradient_matrix", gradient_matrix)
+            if objective_names is not None:
+                for index, objective_name in enumerate(objective_names):
+                    details[f"gradient[{index:02d}]/{objective_name}"] = gradient_matrix[:, index]
+            return details
 
         with torch.no_grad():
             num_objectives = gradient_matrix.shape[1]
             gram = gradient_matrix.T @ gradient_matrix
-            eigenvalues, right_vectors = torch.linalg.eigh(gram)
+            if not bool(torch.isfinite(gram).all()):
+                _raise_numeric_error(
+                    "pga_gram_matrix",
+                    failure_tensors(gram=gram),
+                    context=diagnostic_context,
+                )
+            try:
+                eigenvalues, right_vectors = torch.linalg.eigh(gram)
+            except RuntimeError as exc:
+                _raise_numeric_error(
+                    "pga_gram_eigendecomposition",
+                    failure_tensors(gram=gram),
+                    context=diagnostic_context,
+                    cause=exc,
+                )
+            if not bool(torch.isfinite(eigenvalues).all()) or not bool(
+                torch.isfinite(right_vectors).all()
+            ):
+                _raise_numeric_error(
+                    "pga_eigensystem",
+                    failure_tensors(
+                        gram=gram,
+                        eigenvalues=eigenvalues,
+                        right_vectors=right_vectors,
+                    ),
+                    context=diagnostic_context,
+                )
             eigenvalues = eigenvalues.clamp_min(0)
             order = torch.argsort(eigenvalues, descending=True)
             eigenvalues = eigenvalues[order]
@@ -155,18 +298,19 @@ class PGASolver:
                 useful_rank = min(useful_rank, rank)
 
             if useful_rank == 0:
-                objective_weights = torch.full(
-                    (num_objectives,),
-                    1.0 / num_objectives,
-                    device=gradient_matrix.device,
-                    dtype=gradient_matrix.dtype,
+                _raise_numeric_error(
+                    "pga_zero_useful_rank",
+                    failure_tensors(gram=gram, eigenvalues=eigenvalues),
+                    context=diagnostic_context,
                 )
-                aggregate_grad = gradient_matrix @ objective_weights
-                singular_values = eigenvalues[:0]
-                principal_weights = right_vectors[:, :0]
             elif method == "gram":
                 principal_weights = right_vectors[:, :useful_rank]
                 singular_values = torch.sqrt(eigenvalues[:useful_rank])
+                PGASolver._validate_retained_sigmas(
+                    singular_values,
+                    failure_tensors(gram=gram, eigenvalues=eigenvalues),
+                    diagnostic_context,
+                )
                 if direction_weighting == "uniform":
                     direction_weights = torch.full(
                         (useful_rank,),
@@ -181,8 +325,23 @@ class PGASolver:
                 aggregate_grad = gradient_matrix @ objective_weights
             else:
                 singular_values = torch.sqrt(eigenvalues[:useful_rank])
+                PGASolver._validate_retained_sigmas(
+                    singular_values,
+                    failure_tensors(gram=gram, eigenvalues=eigenvalues),
+                    diagnostic_context,
+                )
                 basis, factor = PGASolver._factorize(
-                    gradient_matrix, useful_rank, method, max_iterations, tolerance
+                    gradient_matrix,
+                    useful_rank,
+                    method,
+                    max_iterations,
+                    tolerance,
+                    diagnostic_context=diagnostic_context,
+                    diagnostic_tensors=failure_tensors(
+                        gram=gram,
+                        eigenvalues=eigenvalues,
+                        retained_sigmas=singular_values,
+                    ),
                 )
                 if direction_weighting == "uniform":
                     basis_weights = torch.full(
@@ -196,14 +355,75 @@ class PGASolver:
                         torch.finfo(gradient_matrix.dtype).eps
                     )
                     basis_weights = strengths / strengths.sum()
+                if not bool(torch.isfinite(basis_weights).all()):
+                    _raise_numeric_error(
+                        "pga_basis_weights",
+                        failure_tensors(
+                            gram=gram,
+                            eigenvalues=eigenvalues,
+                            retained_sigmas=singular_values,
+                            factor=factor,
+                            basis_weights=basis_weights,
+                        ),
+                        context=diagnostic_context,
+                    )
                 target_grad = basis @ basis_weights
-                objective_weights = torch.linalg.pinv(gram) @ (gradient_matrix.T @ target_grad)
+                objective_rhs = gradient_matrix.T @ target_grad
+                try:
+                    gram_pinv = torch.linalg.pinv(gram)
+                except RuntimeError as exc:
+                    _raise_numeric_error(
+                        "pga_gram_pseudoinverse",
+                        failure_tensors(
+                            gram=gram,
+                            eigenvalues=eigenvalues,
+                            retained_sigmas=singular_values,
+                            factor=factor,
+                            basis_weights=basis_weights,
+                            target_grad=target_grad,
+                            objective_rhs=objective_rhs,
+                        ),
+                        context=diagnostic_context,
+                        cause=exc,
+                    )
+                objective_weights = gram_pinv @ objective_rhs
                 aggregate_grad = gradient_matrix @ objective_weights
                 principal_weights = factor.T
+
+            if not bool(torch.isfinite(objective_weights).all()) or not bool(
+                torch.isfinite(aggregate_grad).all()
+            ):
+                _raise_numeric_error(
+                    "pga_final_aggregation",
+                    failure_tensors(
+                        gram=gram,
+                        eigenvalues=eigenvalues,
+                        retained_sigmas=singular_values,
+                        objective_weights=objective_weights,
+                        aggregate_grad=aggregate_grad,
+                    ),
+                    context=diagnostic_context,
+                )
 
             if restore_singleton_dim:
                 aggregate_grad = aggregate_grad.unsqueeze(0)
             return aggregate_grad, objective_weights, singular_values, principal_weights
+
+    @staticmethod
+    def _validate_retained_sigmas(
+        singular_values: torch.Tensor,
+        diagnostic_tensors: dict[str, torch.Tensor],
+        diagnostic_context: str,
+    ) -> None:
+        if (
+            not bool(torch.isfinite(singular_values).all())
+            or bool(torch.any(singular_values <= 0))
+        ):
+            _raise_numeric_error(
+                "pga_retained_sigmas",
+                {**diagnostic_tensors, "retained_sigmas": singular_values},
+                context=diagnostic_context,
+            )
 
     @staticmethod
     def _factorize(
@@ -212,17 +432,64 @@ class PGASolver:
         method: str,
         max_iterations: int,
         tolerance: float,
+        *,
+        diagnostic_context: str = "",
+        diagnostic_tensors: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Solve ``min ||G - W H||_F`` with orthogonal ``W`` and optional ``H >= 0``."""
-        _, singular_values, right_vectors_t = torch.linalg.svd(grads, full_matrices=False)
+        diagnostics = diagnostic_tensors or {"gradient_matrix": grads}
+        try:
+            _, singular_values, right_vectors_t = torch.linalg.svd(grads, full_matrices=False)
+        except RuntimeError as exc:
+            _raise_numeric_error(
+                "pga_initial_svd",
+                diagnostics,
+                context=diagnostic_context,
+                cause=exc,
+            )
+        if not bool(torch.isfinite(singular_values).all()) or not bool(
+            torch.isfinite(right_vectors_t).all()
+        ):
+            _raise_numeric_error(
+                "pga_initial_svd_output",
+                {
+                    **diagnostics,
+                    "factorization_sigmas": singular_values,
+                    "right_vectors_t": right_vectors_t,
+                },
+                context=diagnostic_context,
+            )
         factor = singular_values[:rank].unsqueeze(1) * right_vectors_t[:rank]
         if method == "os_nmf":
             factor = factor.abs()
 
-        for _ in range(max_iterations):
-            left_vectors, _, right_vectors_t = torch.linalg.svd(
-                grads @ factor.T, full_matrices=False
-            )
+        for iteration in range(max_iterations):
+            factor_cross_product = grads @ factor.T
+            if not bool(torch.isfinite(factor_cross_product).all()):
+                _raise_numeric_error(
+                    "pga_factorization_cross_product",
+                    {
+                        **diagnostics,
+                        "factor": factor,
+                        "factor_cross_product": factor_cross_product,
+                    },
+                    context=f"{diagnostic_context}, os_nmf_iteration={iteration}",
+                )
+            try:
+                left_vectors, _, right_vectors_t = torch.linalg.svd(
+                    factor_cross_product, full_matrices=False
+                )
+            except RuntimeError as exc:
+                _raise_numeric_error(
+                    "pga_factorization_svd",
+                    {
+                        **diagnostics,
+                        "factor": factor,
+                        "factor_cross_product": factor_cross_product,
+                    },
+                    context=f"{diagnostic_context}, os_nmf_iteration={iteration}",
+                    cause=exc,
+                )
             basis = left_vectors[:, :rank] @ right_vectors_t[:rank]
             updated_factor = basis.T @ grads
             if method == "os_nmf":
@@ -231,6 +498,23 @@ class PGASolver:
             change = torch.linalg.vector_norm(updated_factor - factor)
             scale = torch.linalg.vector_norm(factor).clamp_min(torch.finfo(grads.dtype).eps)
             factor = updated_factor
+            if (
+                not bool(torch.isfinite(basis).all())
+                or not bool(torch.isfinite(factor).all())
+                or not bool(torch.isfinite(change))
+                or not bool(torch.isfinite(scale))
+            ):
+                _raise_numeric_error(
+                    "pga_factorization_update",
+                    {
+                        **diagnostics,
+                        "basis": basis,
+                        "factor": factor,
+                        "change": change,
+                        "scale": scale,
+                    },
+                    context=f"{diagnostic_context}, os_nmf_iteration={iteration}",
+                )
             if change <= tolerance * scale:
                 break
         return basis, factor
@@ -269,6 +553,149 @@ class PGASolver:
 
 
 
+@dataclass
+class HierarchicalPGAResult:
+    aggregate_grad: torch.Tensor
+    objective_weights: torch.Tensor
+    group_grads: torch.Tensor
+    weighted_group_grads: torch.Tensor
+    group_cosine_matrix: torch.Tensor
+    outer_objective_weights: torch.Tensor
+    outer_singular_values: torch.Tensor
+    outer_factor_strengths: torch.Tensor
+    outer_factor_weights: torch.Tensor
+    flat_aggregate_grad: torch.Tensor
+    flat_singular_values: torch.Tensor
+
+
+def aggregate_hierarchical_5_pga(
+    stacked_actor_grads: torch.Tensor,
+    objective_names: Sequence[str],
+    *,
+    rank: int | None,
+    direction_weighting: str,
+    diagnostic_context: str = "",
+) -> HierarchicalPGAResult:
+    """Aggregate 16 actor objectives through five semantic PGA groups."""
+    if stacked_actor_grads.ndim != 2:
+        raise ValueError(
+            "stacked_actor_grads must have shape [objectives, parameters], got "
+            f"{tuple(stacked_actor_grads.shape)}."
+        )
+    if len(objective_names) != stacked_actor_grads.shape[0]:
+        raise ValueError(
+            "objective_names must match stacked_actor_grads rows, got "
+            f"{len(objective_names)} names and {stacked_actor_grads.shape[0]} rows."
+        )
+    if len(set(objective_names)) != len(objective_names):
+        raise ValueError("Hierarchical-5 PGA requires unique objective names.")
+
+    expected_names = {
+        objective_name
+        for _, group_objective_names, _ in HIERARCHICAL_5_PGA_GROUPS
+        for objective_name in group_objective_names
+    }
+    actual_names = set(objective_names)
+    if len(objective_names) != HIERARCHICAL_5_PGA_OBJECTIVE_COUNT or actual_names != expected_names:
+        missing = sorted(expected_names - actual_names)
+        unexpected = sorted(actual_names - expected_names)
+        raise ValueError(
+            "Hierarchical-5 PGA requires exactly the configured 16 objectives; "
+            f"missing={missing}, unexpected={unexpected}, count={len(objective_names)}."
+        )
+
+    objective_index = {objective_name: index for index, objective_name in enumerate(objective_names)}
+    group_grads = []
+    inner_objective_weights = []
+    group_indices = []
+    for group_name, group_objective_names, _ in HIERARCHICAL_5_PGA_GROUPS:
+        indices = [objective_index[objective_name] for objective_name in group_objective_names]
+        group_grad, group_weights, _, _ = PGASolver.apply(
+            stacked_actor_grads[indices].T.unsqueeze(0),
+            rank=rank,
+            method="os_nmf",
+            direction_weighting=direction_weighting,
+            diagnostic_context=f"{diagnostic_context}, inner_group={group_name}",
+            objective_names=group_objective_names,
+        )
+        group_grads.append(group_grad.squeeze(0))
+        inner_objective_weights.append(group_weights)
+        group_indices.append(indices)
+
+    group_grads_tensor = torch.stack(group_grads, dim=0)
+    group_size_weights = group_grads_tensor.new_tensor(
+        [group_weight for _, _, group_weight in HIERARCHICAL_5_PGA_GROUPS]
+    )
+    # PGASolver receives these weighted columns directly. There is deliberately
+    # no per-column normalization between this multiplication and the outer PGA.
+    weighted_group_grads = group_grads_tensor * group_size_weights.unsqueeze(1)
+    group_names = [group_name for group_name, _, _ in HIERARCHICAL_5_PGA_GROUPS]
+    outer_grad, outer_objective_weights, outer_singular_values, outer_principal_weights = PGASolver.apply(
+        weighted_group_grads.T.unsqueeze(0),
+        rank=rank,
+        method="os_nmf",
+        direction_weighting=direction_weighting,
+        diagnostic_context=f"{diagnostic_context}, outer_groups",
+        objective_names=group_names,
+    )
+    outer_grad = outer_grad.squeeze(0)
+
+    objective_weights = torch.zeros(
+        len(objective_names),
+        dtype=stacked_actor_grads.dtype,
+        device=stacked_actor_grads.device,
+    )
+    for group_index, indices in enumerate(group_indices):
+        objective_weights[indices] = (
+            outer_objective_weights[group_index]
+            * group_size_weights[group_index]
+            * inner_objective_weights[group_index]
+        )
+
+    group_norms = group_grads_tensor.norm(dim=1, keepdim=True)
+    normalized_group_grads = torch.where(
+        group_norms > 1.0e-12,
+        group_grads_tensor / group_norms.clamp_min(1.0e-12),
+        torch.zeros_like(group_grads_tensor),
+    )
+    group_cosine_matrix = normalized_group_grads @ normalized_group_grads.T
+
+    # For OS-NMF, PGASolver returns factor.T as outer_principal_weights.
+    outer_factor_strengths = outer_principal_weights.norm(dim=0)
+    if direction_weighting == "uniform":
+        outer_factor_weights = torch.full_like(
+            outer_factor_strengths, 1.0 / len(outer_factor_strengths)
+        )
+    else:
+        outer_factor_weights = outer_factor_strengths / outer_factor_strengths.sum().clamp_min(
+            torch.finfo(outer_factor_strengths.dtype).eps
+        )
+
+    # This diagnostic uses the unchanged flat-16 solver on the same gradients.
+    flat_grad, _, flat_singular_values, _ = PGASolver.apply(
+        stacked_actor_grads.T.unsqueeze(0),
+        rank=rank,
+        method="os_nmf",
+        direction_weighting=direction_weighting,
+        diagnostic_context=f"{diagnostic_context}, flat_comparison",
+        objective_names=objective_names,
+    )
+
+    return HierarchicalPGAResult(
+        aggregate_grad=outer_grad,
+        objective_weights=objective_weights,
+        group_grads=group_grads_tensor,
+        weighted_group_grads=weighted_group_grads,
+        group_cosine_matrix=group_cosine_matrix,
+        outer_objective_weights=outer_objective_weights,
+        outer_singular_values=outer_singular_values,
+        outer_factor_strengths=outer_factor_strengths,
+        outer_factor_weights=outer_factor_weights,
+        flat_aggregate_grad=flat_grad.squeeze(0),
+        flat_singular_values=flat_singular_values,
+    )
+
+
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
@@ -302,6 +729,7 @@ class PPO:
         min_action_std: float | None = None,
         debug_amtl: bool = False,
         debug_amtl_log_interval: int = 100,
+        actor_pga_mode: str = "flat",
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -329,6 +757,11 @@ class PPO:
         if amtl_apply_to not in {"none", "actor"}:
             raise ValueError(
                 f"Unsupported amtl_apply_to='{amtl_apply_to}'. This branch supports only 'none' and 'actor'."
+            )
+        if actor_pga_mode not in {"flat", "hierarchical_5"}:
+            raise ValueError(
+                "actor_pga_mode must be 'flat' or 'hierarchical_5', got "
+                f"{actor_pga_mode!r}."
             )
         if min_action_std is not None and min_action_std <= 0.0:
             raise ValueError("min_action_std must be positive or None.")
@@ -421,6 +854,7 @@ class PPO:
         self.amtl_apply_to = amtl_apply_to
         self.use_actor_amtl = amtl_apply_to == "actor"
         self.use_critic_amtl = False
+        self.actor_pga_mode = actor_pga_mode
         self.pga_rank = pga_rank
         self.pga_direction_weighting = pga_direction_weighting
         self.pga_match_ppo_grad_norm = pga_match_ppo_grad_norm
@@ -498,9 +932,57 @@ class PPO:
             return
         with torch.no_grad():
             if self.policy.noise_std_type == "scalar":
+                if not bool(torch.isfinite(std_param).all()) or bool(torch.any(std_param <= 0)):
+                    _raise_numeric_error(
+                        "policy_learned_action_std_parameter",
+                        {"learned_action_std_parameter": std_param},
+                        context=f"update={self.update_counter}, before_min_std_clamp",
+                    )
                 std_param.clamp_(min=self.min_action_std)
             elif self.policy.noise_std_type == "log":
+                actual_std = torch.exp(std_param)
+                if not bool(torch.isfinite(actual_std).all()) or bool(torch.any(actual_std <= 0)):
+                    _raise_numeric_error(
+                        "policy_learned_log_std_parameter",
+                        {
+                            "learned_log_std_parameter": std_param,
+                            "actual_action_std": actual_std,
+                        },
+                        context=f"update={self.update_counter}, before_min_std_clamp",
+                    )
                 std_param.clamp_(min=math.log(self.min_action_std))
+
+    @staticmethod
+    def _validate_policy_distribution_numerics(
+        mu: torch.Tensor,
+        sigma: torch.Tensor,
+        old_mu: torch.Tensor,
+        old_sigma: torch.Tensor,
+        action_entropy: torch.Tensor,
+        *,
+        context: str,
+    ) -> None:
+        invalid = (
+            not bool(torch.isfinite(mu).all())
+            or not bool(torch.isfinite(sigma).all())
+            or bool(torch.any(sigma <= 0))
+            or not bool(torch.isfinite(old_mu).all())
+            or not bool(torch.isfinite(old_sigma).all())
+            or bool(torch.any(old_sigma <= 0))
+            or not bool(torch.isfinite(action_entropy).all())
+        )
+        if invalid:
+            _raise_numeric_error(
+                "policy_action_distribution",
+                {
+                    "mu": mu,
+                    "sigma": sigma,
+                    "old_mu": old_mu,
+                    "old_sigma": old_sigma,
+                    "action_entropy": action_entropy,
+                },
+                context=context,
+            )
 
     @staticmethod
     def _collect_flat_grad(params: Sequence[torch.nn.Parameter]) -> torch.Tensor:
@@ -1340,6 +1822,10 @@ class PPO:
         mean_actor_amtl_vs_objective_cosine_min = 0.0
         mean_actor_amtl_vs_objective_cosine_max = 0.0
         mean_actor_amtl_vs_objective_cosine_mean = 0.0
+        mean_actor_pga_retained_rank = 0.0
+        mean_actor_pga_sigma_min = 0.0
+        mean_actor_pga_sigma_max = 0.0
+        mean_actor_pga_sigma_condition_number = 0.0
         mean_actor_scale = 0.0
         mean_critic_amtl_grad_norm = 0.0
         critic_value_loss_sums: torch.Tensor | None = None
@@ -1354,6 +1840,7 @@ class PPO:
         actor_pga_energy_fraction_sums: torch.Tensor | None = None
         actor_pga_svd_direction_loading_sums: torch.Tensor | None = None
         actor_pga_svd_direction_energy_fraction_sums: torch.Tensor | None = None
+        actor_hierarchical_diagnostic_sums: dict[str, torch.Tensor] = {}
         mean_rnd_loss = 0.0 if self.rnd else None
         mean_symmetry_loss = 0.0 if self.symmetry else None
 
@@ -1363,6 +1850,7 @@ class PPO:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         debug_logged_this_update = False
+        pga_call_index = 0
         for (
             obs_batch,
             actions_batch,
@@ -1414,6 +1902,14 @@ class PPO:
             sigma_batch = self.policy.action_std[:original_batch_size]
             action_entropy_batch = self.policy.distribution.entropy()[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
+            self._validate_policy_distribution_numerics(
+                mu_batch,
+                sigma_batch,
+                old_mu_batch,
+                old_sigma_batch,
+                action_entropy_batch,
+                context=f"update={self.update_counter}, minibatch={pga_call_index}",
+            )
 
             kl_mean_value = 0.0
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -1563,6 +2059,11 @@ class PPO:
             actor_pga_energy_fractions: torch.Tensor | None = None
             actor_pga_svd_direction_loadings: torch.Tensor | None = None
             actor_pga_svd_direction_energy_fractions: torch.Tensor | None = None
+            actor_pga_retained_rank = 0.0
+            actor_pga_sigma_min = 0.0
+            actor_pga_sigma_max = 0.0
+            actor_pga_sigma_condition_number = 0.0
+            actor_hierarchical_diagnostics: dict[str, torch.Tensor] = {}
             actor_scale = 0.0
             num_actor_objectives = 1
             num_critic_objectives = 1
@@ -1601,17 +2102,43 @@ class PPO:
                 self._zero_existing_grads(actor_params)
                 stacked_actor_grads = torch.stack(actor_grads, dim=0)
                 raw_actor_cosine_stats = self._pairwise_cosine_stats(stacked_actor_grads)
+                objective_names = self._get_actor_objective_names(num_actor_objectives)
                 # PGA expects columns to be objective gradients. This is the
                 # same gradient layout used in sample_example.txt:
                 # [1, parameters, objectives]. Its aggregate replaces the
                 # actor gradients immediately before the optimizer step.
-                aggregate_grad, actor_pga_objective_weights, singular_values, _ = PGASolver.apply(
-                    stacked_actor_grads.T.unsqueeze(0),
-                    rank=self.pga_rank,
-                    method="os_nmf",
-                    direction_weighting=self.pga_direction_weighting,
+                pga_context = (
+                    f"update={self.update_counter}, minibatch={pga_call_index}, "
+                    f"mode={self.actor_pga_mode}, rank={self.pga_rank}, "
+                    f"weighting={self.pga_direction_weighting}"
                 )
-                aligned_actor_grad = aggregate_grad.squeeze(0)
+                hierarchical_result: HierarchicalPGAResult | None = None
+                if self.actor_pga_mode == "flat":
+                    aggregate_grad, actor_pga_objective_weights, singular_values, _ = PGASolver.apply(
+                        stacked_actor_grads.T.unsqueeze(0),
+                        rank=self.pga_rank,
+                        method="os_nmf",
+                        direction_weighting=self.pga_direction_weighting,
+                        diagnostic_context=pga_context,
+                        objective_names=objective_names,
+                    )
+                    aligned_actor_grad = aggregate_grad.squeeze(0)
+                else:
+                    hierarchical_result = aggregate_hierarchical_5_pga(
+                        stacked_actor_grads,
+                        objective_names,
+                        rank=self.pga_rank,
+                        direction_weighting=self.pga_direction_weighting,
+                        diagnostic_context=pga_context,
+                    )
+                    aligned_actor_grad = hierarchical_result.aggregate_grad
+                    actor_pga_objective_weights = hierarchical_result.objective_weights
+                    # Keep the existing 16-objective spectrum tags comparable
+                    # with flat runs. Applied outer-PGA spectra use dedicated
+                    # actor_hierarchical/outer_pga tags below.
+                    singular_values = hierarchical_result.flat_singular_values
+                    hierarchical_grad_norm_before_ppo_match = aligned_actor_grad.norm()
+                pga_call_index += 1
                 if self.pga_match_ppo_grad_norm:
                     aligned_norm = aligned_actor_grad.norm()
                     norm_scale = torch.where(
@@ -1621,6 +2148,120 @@ class PPO:
                     )
                     aligned_actor_grad = aligned_actor_grad * norm_scale
                     actor_pga_objective_weights = actor_pga_objective_weights * norm_scale
+                if hierarchical_result is not None:
+                    group_norms = hierarchical_result.group_grads.norm(dim=1)
+                    weighted_group_norms = hierarchical_result.weighted_group_grads.norm(dim=1)
+                    group_vs_final_cosines = self._cosine_against_reference(
+                        hierarchical_result.group_grads, aligned_actor_grad
+                    )
+                    num_groups = len(HIERARCHICAL_5_PGA_GROUPS)
+                    outer_singular_values = aligned_actor_grad.new_zeros(num_groups)
+                    outer_singular_values[
+                        : len(hierarchical_result.outer_singular_values)
+                    ] = hierarchical_result.outer_singular_values
+                    outer_energies = outer_singular_values.square()
+                    outer_energy_fractions = outer_energies / outer_energies.sum().clamp_min(1.0e-12)
+                    outer_factor_strengths = torch.zeros_like(outer_singular_values)
+                    outer_factor_strengths[
+                        : len(hierarchical_result.outer_factor_strengths)
+                    ] = hierarchical_result.outer_factor_strengths
+                    outer_factor_weights = torch.zeros_like(outer_singular_values)
+                    outer_factor_weights[
+                        : len(hierarchical_result.outer_factor_weights)
+                    ] = hierarchical_result.outer_factor_weights
+                    outer_sigma_min = hierarchical_result.outer_singular_values.min()
+                    outer_sigma_max = hierarchical_result.outer_singular_values.max()
+                    actor_hierarchical_diagnostics.update(
+                        {
+                            "actor_hierarchical_final_grad_norm": aligned_actor_grad.norm(),
+                            "actor_hierarchical_final_grad_norm_before_ppo_match": (
+                                hierarchical_grad_norm_before_ppo_match
+                            ),
+                            "actor_hierarchical_vs_flat_cosine": aligned_actor_grad.new_tensor(
+                                self._safe_cosine_similarity(
+                                    aligned_actor_grad, hierarchical_result.flat_aggregate_grad
+                                )
+                            ),
+                            "actor_hierarchical_outer_pga_retained_rank": aligned_actor_grad.new_tensor(
+                                float(len(hierarchical_result.outer_singular_values))
+                            ),
+                            "actor_hierarchical_outer_pga_sigma_min": outer_sigma_min,
+                            "actor_hierarchical_outer_pga_sigma_max": outer_sigma_max,
+                            "actor_hierarchical_outer_pga_sigma_condition_number": (
+                                outer_sigma_max
+                                / outer_sigma_min.clamp_min(
+                                    torch.finfo(outer_sigma_min.dtype).tiny
+                                )
+                            ),
+                        }
+                    )
+                    for group_index, (group_name, _, group_weight) in enumerate(
+                        HIERARCHICAL_5_PGA_GROUPS
+                    ):
+                        actor_hierarchical_diagnostics[
+                            f"actor_hierarchical_group_norm_before_outer_weight/{group_name}"
+                        ] = group_norms[group_index]
+                        actor_hierarchical_diagnostics[
+                            f"actor_hierarchical_outer_input_weight/{group_name}"
+                        ] = aligned_actor_grad.new_tensor(group_weight)
+                        actor_hierarchical_diagnostics[
+                            f"actor_hierarchical_weighted_group_norm/{group_name}"
+                        ] = weighted_group_norms[group_index]
+                        actor_hierarchical_diagnostics[
+                            f"actor_hierarchical_group_vs_final_cosine/{group_name}"
+                        ] = group_vs_final_cosines[group_index]
+                        actor_hierarchical_diagnostics[
+                            f"actor_hierarchical_outer_pga_objective_weight/{group_name}"
+                        ] = hierarchical_result.outer_objective_weights[group_index]
+                        for other_group_index, (other_group_name, _, _) in enumerate(
+                            HIERARCHICAL_5_PGA_GROUPS
+                        ):
+                            actor_hierarchical_diagnostics[
+                                f"actor_hierarchical_group_cosine/{group_name}__{other_group_name}"
+                            ] = hierarchical_result.group_cosine_matrix[
+                                group_index, other_group_index
+                            ]
+                    for direction_index in range(num_groups):
+                        direction_name = f"direction_{direction_index:02d}"
+                        actor_hierarchical_diagnostics[
+                            f"actor_hierarchical_outer_pga_singular_value/{direction_name}"
+                        ] = outer_singular_values[direction_index]
+                        actor_hierarchical_diagnostics[
+                            f"actor_hierarchical_outer_pga_energy/{direction_name}"
+                        ] = outer_energies[direction_index]
+                        actor_hierarchical_diagnostics[
+                            f"actor_hierarchical_outer_pga_energy_fraction/{direction_name}"
+                        ] = outer_energy_fractions[direction_index]
+                        actor_hierarchical_diagnostics[
+                            f"actor_hierarchical_outer_pga_factor_strength/{direction_name}"
+                        ] = outer_factor_strengths[direction_index]
+                        actor_hierarchical_diagnostics[
+                            f"actor_hierarchical_outer_pga_factor_weight/{direction_name}"
+                        ] = outer_factor_weights[direction_index]
+                if (
+                    not bool(torch.isfinite(aligned_actor_grad).all())
+                    or not bool(torch.isfinite(actor_pga_objective_weights).all())
+                ):
+                    _raise_numeric_error(
+                        "pga_norm_matching",
+                        {
+                            "stacked_actor_grads": stacked_actor_grads,
+                            "standard_actor_grad": standard_actor_grad,
+                            "aligned_actor_grad": aligned_actor_grad,
+                            "objective_weights": actor_pga_objective_weights,
+                        },
+                        context=(
+                            f"update={self.update_counter}, minibatch={pga_call_index - 1}, "
+                            f"rank={self.pga_rank}, weighting={self.pga_direction_weighting}"
+                        ),
+                    )
+
+                actor_pga_retained_rank = float(len(singular_values))
+                actor_pga_sigma_min = float(singular_values.min().item())
+                actor_pga_sigma_max = float(singular_values.max().item())
+                actor_pga_sigma_condition_number = (
+                    actor_pga_sigma_max / max(actor_pga_sigma_min, torch.finfo(singular_values.dtype).tiny)
+                )
 
                 # Singular values are ordered by PGA direction strength. Pad
                 # numerically discarded directions with zeros so every update
@@ -1631,8 +2272,32 @@ class PPO:
                     dtype=singular_values.dtype,
                 )
                 actor_pga_singular_values[: len(singular_values)] = singular_values
+                sigma_square_limit = math.sqrt(torch.finfo(singular_values.dtype).max)
+                if bool(torch.any(singular_values.abs() > sigma_square_limit)):
+                    _raise_numeric_error(
+                        "pga_sigma_energy_square_overflow",
+                        {
+                            "retained_sigmas": singular_values,
+                            "stacked_actor_grads": stacked_actor_grads,
+                        },
+                        context=(
+                            f"update={self.update_counter}, minibatch={pga_call_index - 1}, "
+                            f"float_square_limit={sigma_square_limit:.9e}"
+                        ),
+                    )
                 actor_pga_energies = actor_pga_singular_values.square()
                 actor_pga_energy_fractions = actor_pga_energies / actor_pga_energies.sum().clamp_min(1.0e-12)
+                if not bool(torch.isfinite(actor_pga_energy_fractions).all()):
+                    _raise_numeric_error(
+                        "pga_sigma_energy_logging",
+                        {
+                            "retained_sigmas": singular_values,
+                            "padded_sigmas": actor_pga_singular_values,
+                            "sigma_energies": actor_pga_energies,
+                            "sigma_energy_fractions": actor_pga_energy_fractions,
+                        },
+                        context=f"update={self.update_counter}, minibatch={pga_call_index - 1}",
+                    )
 
                 # Decompose each ranked SVD direction into named objectives.
                 # ``right_vectors[:, k]`` is the objective-space loading for
@@ -1640,7 +2305,27 @@ class PPO:
                 # Eigenvector signs are arbitrary, so log absolute loadings
                 # and squared fractions rather than unstable signed values.
                 objective_gram = stacked_actor_grads @ stacked_actor_grads.T
-                _, right_vectors = torch.linalg.eigh(objective_gram)
+                if not bool(torch.isfinite(objective_gram).all()):
+                    _raise_numeric_error(
+                        "pga_logging_gram_matrix",
+                        {
+                            "stacked_actor_grads": stacked_actor_grads,
+                            "objective_gram": objective_gram,
+                        },
+                        context=f"update={self.update_counter}, minibatch={pga_call_index - 1}",
+                    )
+                try:
+                    _, right_vectors = torch.linalg.eigh(objective_gram)
+                except RuntimeError as exc:
+                    _raise_numeric_error(
+                        "pga_logging_eigendecomposition",
+                        {
+                            "stacked_actor_grads": stacked_actor_grads,
+                            "objective_gram": objective_gram,
+                        },
+                        context=f"update={self.update_counter}, minibatch={pga_call_index - 1}",
+                        cause=exc,
+                    )
                 right_vectors = right_vectors.flip(dims=(1,))
                 actor_pga_svd_direction_loadings = right_vectors.abs()
                 actor_pga_svd_direction_energy_fractions = right_vectors.square()
@@ -1844,6 +2529,10 @@ class PPO:
             mean_actor_amtl_vs_objective_cosine_min += actor_amtl_vs_objective_cosine_min
             mean_actor_amtl_vs_objective_cosine_max += actor_amtl_vs_objective_cosine_max
             mean_actor_amtl_vs_objective_cosine_mean += actor_amtl_vs_objective_cosine_mean
+            mean_actor_pga_retained_rank += actor_pga_retained_rank
+            mean_actor_pga_sigma_min += actor_pga_sigma_min
+            mean_actor_pga_sigma_max += actor_pga_sigma_max
+            mean_actor_pga_sigma_condition_number += actor_pga_sigma_condition_number
             mean_actor_scale += actor_scale
             if actor_objective_vs_ppo_cosines is not None:
                 if actor_objective_vs_ppo_cosine_sums is None:
@@ -1891,6 +2580,12 @@ class PPO:
                 actor_pga_svd_direction_energy_fraction_sums += (
                     actor_pga_svd_direction_energy_fractions.detach()
                 )
+            for diagnostic_name, diagnostic_value in actor_hierarchical_diagnostics.items():
+                if diagnostic_name not in actor_hierarchical_diagnostic_sums:
+                    actor_hierarchical_diagnostic_sums[diagnostic_name] = torch.zeros_like(
+                        diagnostic_value
+                    )
+                actor_hierarchical_diagnostic_sums[diagnostic_name] += diagnostic_value.detach()
             if action_entropy_sums is None:
                 action_entropy_sums = torch.zeros_like(action_entropy_batch.mean(dim=0))
             action_entropy_sums += action_entropy_batch.detach().mean(dim=0)
@@ -1933,6 +2628,10 @@ class PPO:
         mean_actor_amtl_vs_objective_cosine_min /= num_updates
         mean_actor_amtl_vs_objective_cosine_max /= num_updates
         mean_actor_amtl_vs_objective_cosine_mean /= num_updates
+        mean_actor_pga_retained_rank /= num_updates
+        mean_actor_pga_sigma_min /= num_updates
+        mean_actor_pga_sigma_max /= num_updates
+        mean_actor_pga_sigma_condition_number /= num_updates
         mean_actor_scale /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
@@ -1972,6 +2671,11 @@ class PPO:
             "actor_amtl_vs_objective_cosine_min": mean_actor_amtl_vs_objective_cosine_min,
             "actor_amtl_vs_objective_cosine_max": mean_actor_amtl_vs_objective_cosine_max,
             "actor_amtl_vs_objective_cosine_mean": mean_actor_amtl_vs_objective_cosine_mean,
+            "actor_pga_retained_rank": mean_actor_pga_retained_rank,
+            "actor_pga_sigma_min": mean_actor_pga_sigma_min,
+            "actor_pga_sigma_max": mean_actor_pga_sigma_max,
+            "actor_pga_sigma_condition_number": mean_actor_pga_sigma_condition_number,
+            "actor_pga_hierarchical_enabled": 1.0 if self.actor_pga_mode == "hierarchical_5" else 0.0,
             "actor_scale": mean_actor_scale,
             "actor_amtl_enabled": 1.0 if self.use_actor_amtl else 0.0,
             "critic_amtl_enabled": 1.0 if self.use_critic_amtl else 0.0,
@@ -2033,6 +2737,8 @@ class PPO:
                     loss_dict[
                         f"actor_pga_svd_direction_energy_fraction/direction_{direction_index:02d}/{objective_name}"
                     ] = energy_fraction.item()
+        for diagnostic_name, diagnostic_sum in sorted(actor_hierarchical_diagnostic_sums.items()):
+            loss_dict[diagnostic_name] = (diagnostic_sum / num_updates).item()
         if critic_value_loss_sums is not None:
             critic_head_names = self._get_critic_head_names(len(critic_value_loss_sums))
             for head_name, head_loss in zip(critic_head_names, critic_value_loss_sums / num_updates, strict=True):

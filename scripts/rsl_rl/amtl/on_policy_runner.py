@@ -324,7 +324,18 @@ class OnPolicyRunner:
             self._append_objective_rows(objective_rows)
             self._last_logged_objective_rows = objective_rows
 
-        mean_std = self.alg.policy.action_std.mean()
+        action_std = self.alg.policy.action_std
+        if not bool(torch.isfinite(action_std).all()) or bool(torch.any(action_std <= 0)):
+            print(
+                "[NUMERIC ERROR] Invalid policy action standard deviation before logging: "
+                f"shape={tuple(action_std.shape)} dtype={action_std.dtype} device={action_std.device} "
+                f"values={action_std.detach().reshape(-1)[:64].cpu().tolist()}",
+                flush=True,
+            )
+            raise FloatingPointError("Policy action standard deviation contains NaN, Inf, or non-positive values")
+        mean_std = action_std.mean()
+        min_std = action_std.min()
+        max_std = action_std.max()
         fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
 
         # Log losses
@@ -334,6 +345,8 @@ class OnPolicyRunner:
 
         # Log noise std
         self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
+        self.writer.add_scalar("Policy/min_noise_std", min_std.item(), locs["it"])
+        self.writer.add_scalar("Policy/max_noise_std", max_std.item(), locs["it"])
 
         # Log performance
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])

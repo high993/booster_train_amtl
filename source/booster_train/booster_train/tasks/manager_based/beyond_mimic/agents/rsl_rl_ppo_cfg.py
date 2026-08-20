@@ -5,6 +5,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 @configclass
 class AmtlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     amtl_apply_to: str = "actor"
+    actor_pga_mode: str = "flat"
     pga_rank: int | None = None
     pga_direction_weighting: str = "uniform"
     pga_match_ppo_grad_norm: bool = False
@@ -44,6 +45,7 @@ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
         amtl_apply_to="actor",
+        actor_pga_mode="flat",
         pga_rank=None,
         pga_direction_weighting="uniform",
         pga_match_ppo_grad_norm=False,
