@@ -56,7 +56,37 @@ HIERARCHICAL_5_PGA_GROUPS = (
         3.0 / 16.0,
     ),
 )
-HIERARCHICAL_5_PGA_OBJECTIVE_COUNT = 16
+HIERARCHICAL_3_PGA_GROUPS = (
+    (
+        "tracking",
+        (
+            "motion_global_anchor_pos",
+            "motion_global_anchor_ori",
+            "motion_body_pos",
+            "motion_body_ori",
+            "motion_body_lin_vel",
+            "motion_body_ang_vel",
+            "motion_foot_ori",
+            "motion_foot_pos",
+            "motion_hand_ori",
+            "motion_hand_pos",
+            "motion_trunk_ori",
+            "motion_trunk_pos",
+            "motion_trunk_ang_vel",
+        ),
+        0.70,
+    ),
+    (
+        "safety",
+        ("joint_limit", "undesired_contacts"),
+        0.20,
+    ),
+    (
+        "smoothness",
+        ("action_rate_l2",),
+        0.10,
+    ),
+)
 
 
 def _format_numeric_tensor(tensor: torch.Tensor) -> str:
@@ -124,6 +154,35 @@ def _raise_numeric_error(
     raise error
 
 
+def _stable_symmetric_eigh(matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decompose a small symmetric matrix with a robust fallback for CUDA failures."""
+    symmetric_matrix = 0.5 * (matrix + matrix.mT)
+    try:
+        return torch.linalg.eigh(symmetric_matrix)
+    except RuntimeError as primary_error:
+        # CUDA's symmetric eigensolver can occasionally fail on finite,
+        # nearly rank-deficient Gram matrices. The matrix is objective-sized,
+        # so a CPU float64 retry is cheap and avoids discarding the update.
+        fallback_matrix = symmetric_matrix.detach().to(device="cpu", dtype=torch.float64)
+        try:
+            eigenvalues, eigenvectors = torch.linalg.eigh(fallback_matrix)
+        except RuntimeError as fallback_error:
+            raise RuntimeError(
+                "Symmetric eigendecomposition failed on the original device and "
+                f"on the CPU float64 fallback. Original error: {primary_error}"
+            ) from fallback_error
+        warnings.warn(
+            "Recovered from a symmetric eigendecomposition failure with a CPU float64 retry: "
+            f"{primary_error}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return (
+            eigenvalues.to(device=matrix.device, dtype=matrix.dtype),
+            eigenvectors.to(device=matrix.device, dtype=matrix.dtype),
+        )
+
+
 def set_shared_grad(shared_params, grad_vec):
     # Write a flattened gradient vector back into a parameter list.
     expected_numel = sum(p.numel() for p in shared_params)
@@ -157,7 +216,7 @@ class ProcrustesSolver:
             cov_grad_matrix_e = cov_grad_matrix_e.mean(0)
             
             #compute eigen vectors
-            singulars, basis = torch.linalg.eigh(cov_grad_matrix_e)
+            singulars, basis = _stable_symmetric_eigh(cov_grad_matrix_e)
             tol = (
                 torch.max(singulars)
                 * max(cov_grad_matrix_e.shape[-2:])
@@ -265,7 +324,7 @@ class PGASolver:
                     context=diagnostic_context,
                 )
             try:
-                eigenvalues, right_vectors = torch.linalg.eigh(gram)
+                eigenvalues, right_vectors = _stable_symmetric_eigh(gram)
             except RuntimeError as exc:
                 _raise_numeric_error(
                     "pga_gram_eigendecomposition",
@@ -559,6 +618,7 @@ class HierarchicalPGAResult:
     objective_weights: torch.Tensor
     group_grads: torch.Tensor
     weighted_group_grads: torch.Tensor
+    outer_input_scales: torch.Tensor
     group_cosine_matrix: torch.Tensor
     outer_objective_weights: torch.Tensor
     outer_singular_values: torch.Tensor
@@ -568,15 +628,17 @@ class HierarchicalPGAResult:
     flat_singular_values: torch.Tensor
 
 
-def aggregate_hierarchical_5_pga(
+def _aggregate_hierarchical_pga(
     stacked_actor_grads: torch.Tensor,
     objective_names: Sequence[str],
     *,
+    groups: Sequence[tuple[str, Sequence[str], float]],
+    normalize_outer_inputs: bool,
     rank: int | None,
     direction_weighting: str,
     diagnostic_context: str = "",
 ) -> HierarchicalPGAResult:
-    """Aggregate 16 actor objectives through five semantic PGA groups."""
+    """Aggregate actor objectives through semantic groups and an outer PGA solve."""
     if stacked_actor_grads.ndim != 2:
         raise ValueError(
             "stacked_actor_grads must have shape [objectives, parameters], got "
@@ -588,19 +650,22 @@ def aggregate_hierarchical_5_pga(
             f"{len(objective_names)} names and {stacked_actor_grads.shape[0]} rows."
         )
     if len(set(objective_names)) != len(objective_names):
-        raise ValueError("Hierarchical-5 PGA requires unique objective names.")
+        raise ValueError("Hierarchical PGA requires unique objective names.")
 
-    expected_names = {
+    configured_names = [
         objective_name
-        for _, group_objective_names, _ in HIERARCHICAL_5_PGA_GROUPS
+        for _, group_objective_names, _ in groups
         for objective_name in group_objective_names
-    }
+    ]
+    if len(configured_names) != len(set(configured_names)):
+        raise ValueError("Hierarchical PGA groups must not contain duplicate objectives.")
+    expected_names = set(configured_names)
     actual_names = set(objective_names)
-    if len(objective_names) != HIERARCHICAL_5_PGA_OBJECTIVE_COUNT or actual_names != expected_names:
+    if len(objective_names) != len(configured_names) or actual_names != expected_names:
         missing = sorted(expected_names - actual_names)
         unexpected = sorted(actual_names - expected_names)
         raise ValueError(
-            "Hierarchical-5 PGA requires exactly the configured 16 objectives; "
+            "Hierarchical PGA requires exactly the configured objectives; "
             f"missing={missing}, unexpected={unexpected}, count={len(objective_names)}."
         )
 
@@ -608,28 +673,41 @@ def aggregate_hierarchical_5_pga(
     group_grads = []
     inner_objective_weights = []
     group_indices = []
-    for group_name, group_objective_names, _ in HIERARCHICAL_5_PGA_GROUPS:
+    for group_name, group_objective_names, _ in groups:
         indices = [objective_index[objective_name] for objective_name in group_objective_names]
-        group_grad, group_weights, _, _ = PGASolver.apply(
-            stacked_actor_grads[indices].T.unsqueeze(0),
-            rank=rank,
-            method="os_nmf",
-            direction_weighting=direction_weighting,
-            diagnostic_context=f"{diagnostic_context}, inner_group={group_name}",
-            objective_names=group_objective_names,
-        )
-        group_grads.append(group_grad.squeeze(0))
-        inner_objective_weights.append(group_weights)
+        group_gradient_matrix = stacked_actor_grads[indices].T
+        if torch.linalg.vector_norm(group_gradient_matrix) <= 1.0e-12:
+            group_grads.append(group_gradient_matrix.new_zeros(group_gradient_matrix.shape[0]))
+            inner_objective_weights.append(group_gradient_matrix.new_zeros(len(indices)))
+        else:
+            group_grad, group_weights, _, _ = PGASolver.apply(
+                group_gradient_matrix.unsqueeze(0),
+                rank=rank,
+                method="os_nmf",
+                direction_weighting=direction_weighting,
+                diagnostic_context=f"{diagnostic_context}, inner_group={group_name}",
+                objective_names=group_objective_names,
+            )
+            group_grads.append(group_grad.squeeze(0))
+            inner_objective_weights.append(group_weights)
         group_indices.append(indices)
 
     group_grads_tensor = torch.stack(group_grads, dim=0)
-    group_size_weights = group_grads_tensor.new_tensor(
-        [group_weight for _, _, group_weight in HIERARCHICAL_5_PGA_GROUPS]
+    group_weights = group_grads_tensor.new_tensor(
+        [group_weight for _, _, group_weight in groups]
     )
-    # PGASolver receives these weighted columns directly. There is deliberately
-    # no per-column normalization between this multiplication and the outer PGA.
-    weighted_group_grads = group_grads_tensor * group_size_weights.unsqueeze(1)
-    group_names = [group_name for group_name, _, _ in HIERARCHICAL_5_PGA_GROUPS]
+    group_norms = group_grads_tensor.norm(dim=1)
+    if normalize_outer_inputs:
+        nonzero_groups = group_norms > 1.0e-12
+        outer_input_scales = torch.where(
+            nonzero_groups,
+            group_weights / group_norms.clamp_min(1.0e-12),
+            torch.zeros_like(group_norms),
+        )
+    else:
+        outer_input_scales = group_weights
+    weighted_group_grads = group_grads_tensor * outer_input_scales.unsqueeze(1)
+    group_names = [group_name for group_name, _, _ in groups]
     outer_grad, outer_objective_weights, outer_singular_values, outer_principal_weights = PGASolver.apply(
         weighted_group_grads.T.unsqueeze(0),
         rank=rank,
@@ -648,11 +726,11 @@ def aggregate_hierarchical_5_pga(
     for group_index, indices in enumerate(group_indices):
         objective_weights[indices] = (
             outer_objective_weights[group_index]
-            * group_size_weights[group_index]
+            * outer_input_scales[group_index]
             * inner_objective_weights[group_index]
         )
 
-    group_norms = group_grads_tensor.norm(dim=1, keepdim=True)
+    group_norms = group_norms.unsqueeze(1)
     normalized_group_grads = torch.where(
         group_norms > 1.0e-12,
         group_grads_tensor / group_norms.clamp_min(1.0e-12),
@@ -686,6 +764,7 @@ def aggregate_hierarchical_5_pga(
         objective_weights=objective_weights,
         group_grads=group_grads_tensor,
         weighted_group_grads=weighted_group_grads,
+        outer_input_scales=outer_input_scales,
         group_cosine_matrix=group_cosine_matrix,
         outer_objective_weights=outer_objective_weights,
         outer_singular_values=outer_singular_values,
@@ -693,6 +772,46 @@ def aggregate_hierarchical_5_pga(
         outer_factor_weights=outer_factor_weights,
         flat_aggregate_grad=flat_grad.squeeze(0),
         flat_singular_values=flat_singular_values,
+    )
+
+
+def aggregate_hierarchical_5_pga(
+    stacked_actor_grads: torch.Tensor,
+    objective_names: Sequence[str],
+    *,
+    rank: int | None,
+    direction_weighting: str,
+    diagnostic_context: str = "",
+) -> HierarchicalPGAResult:
+    """Aggregate 16 actor objectives through the original five semantic groups."""
+    return _aggregate_hierarchical_pga(
+        stacked_actor_grads,
+        objective_names,
+        groups=HIERARCHICAL_5_PGA_GROUPS,
+        normalize_outer_inputs=False,
+        rank=rank,
+        direction_weighting=direction_weighting,
+        diagnostic_context=diagnostic_context,
+    )
+
+
+def aggregate_hierarchical_3_pga(
+    stacked_actor_grads: torch.Tensor,
+    objective_names: Sequence[str],
+    *,
+    rank: int | None,
+    direction_weighting: str,
+    diagnostic_context: str = "",
+) -> HierarchicalPGAResult:
+    """Aggregate normalized tracking, safety, and smoothness group gradients."""
+    return _aggregate_hierarchical_pga(
+        stacked_actor_grads,
+        objective_names,
+        groups=HIERARCHICAL_3_PGA_GROUPS,
+        normalize_outer_inputs=True,
+        rank=rank,
+        direction_weighting=direction_weighting,
+        diagnostic_context=diagnostic_context,
     )
 
 
@@ -758,9 +877,9 @@ class PPO:
             raise ValueError(
                 f"Unsupported amtl_apply_to='{amtl_apply_to}'. This branch supports only 'none' and 'actor'."
             )
-        if actor_pga_mode not in {"flat", "hierarchical_5"}:
+        if actor_pga_mode not in {"flat", "hierarchical_3", "hierarchical_5"}:
             raise ValueError(
-                "actor_pga_mode must be 'flat' or 'hierarchical_5', got "
+                "actor_pga_mode must be 'flat', 'hierarchical_3', or 'hierarchical_5', got "
                 f"{actor_pga_mode!r}."
             )
         if min_action_std is not None and min_action_std <= 0.0:
@@ -2113,6 +2232,7 @@ class PPO:
                     f"weighting={self.pga_direction_weighting}"
                 )
                 hierarchical_result: HierarchicalPGAResult | None = None
+                hierarchical_groups: Sequence[tuple[str, Sequence[str], float]] | None = None
                 if self.actor_pga_mode == "flat":
                     aggregate_grad, actor_pga_objective_weights, singular_values, _ = PGASolver.apply(
                         stacked_actor_grads.T.unsqueeze(0),
@@ -2123,7 +2243,8 @@ class PPO:
                         objective_names=objective_names,
                     )
                     aligned_actor_grad = aggregate_grad.squeeze(0)
-                else:
+                elif self.actor_pga_mode == "hierarchical_5":
+                    hierarchical_groups = HIERARCHICAL_5_PGA_GROUPS
                     hierarchical_result = aggregate_hierarchical_5_pga(
                         stacked_actor_grads,
                         objective_names,
@@ -2131,6 +2252,17 @@ class PPO:
                         direction_weighting=self.pga_direction_weighting,
                         diagnostic_context=pga_context,
                     )
+                else:
+                    hierarchical_groups = HIERARCHICAL_3_PGA_GROUPS
+                    hierarchical_result = aggregate_hierarchical_3_pga(
+                        stacked_actor_grads,
+                        objective_names,
+                        rank=self.pga_rank,
+                        direction_weighting=self.pga_direction_weighting,
+                        diagnostic_context=pga_context,
+                    )
+
+                if hierarchical_result is not None:
                     aligned_actor_grad = hierarchical_result.aggregate_grad
                     actor_pga_objective_weights = hierarchical_result.objective_weights
                     # Keep the existing 16-objective spectrum tags comparable
@@ -2149,12 +2281,13 @@ class PPO:
                     aligned_actor_grad = aligned_actor_grad * norm_scale
                     actor_pga_objective_weights = actor_pga_objective_weights * norm_scale
                 if hierarchical_result is not None:
+                    assert hierarchical_groups is not None
                     group_norms = hierarchical_result.group_grads.norm(dim=1)
                     weighted_group_norms = hierarchical_result.weighted_group_grads.norm(dim=1)
                     group_vs_final_cosines = self._cosine_against_reference(
                         hierarchical_result.group_grads, aligned_actor_grad
                     )
-                    num_groups = len(HIERARCHICAL_5_PGA_GROUPS)
+                    num_groups = len(hierarchical_groups)
                     outer_singular_values = aligned_actor_grad.new_zeros(num_groups)
                     outer_singular_values[
                         : len(hierarchical_result.outer_singular_values)
@@ -2195,15 +2328,16 @@ class PPO:
                             ),
                         }
                     )
-                    for group_index, (group_name, _, group_weight) in enumerate(
-                        HIERARCHICAL_5_PGA_GROUPS
-                    ):
+                    for group_index, (group_name, _, group_weight) in enumerate(hierarchical_groups):
                         actor_hierarchical_diagnostics[
                             f"actor_hierarchical_group_norm_before_outer_weight/{group_name}"
                         ] = group_norms[group_index]
                         actor_hierarchical_diagnostics[
                             f"actor_hierarchical_outer_input_weight/{group_name}"
                         ] = aligned_actor_grad.new_tensor(group_weight)
+                        actor_hierarchical_diagnostics[
+                            f"actor_hierarchical_outer_input_scale/{group_name}"
+                        ] = hierarchical_result.outer_input_scales[group_index]
                         actor_hierarchical_diagnostics[
                             f"actor_hierarchical_weighted_group_norm/{group_name}"
                         ] = weighted_group_norms[group_index]
@@ -2214,7 +2348,7 @@ class PPO:
                             f"actor_hierarchical_outer_pga_objective_weight/{group_name}"
                         ] = hierarchical_result.outer_objective_weights[group_index]
                         for other_group_index, (other_group_name, _, _) in enumerate(
-                            HIERARCHICAL_5_PGA_GROUPS
+                            hierarchical_groups
                         ):
                             actor_hierarchical_diagnostics[
                                 f"actor_hierarchical_group_cosine/{group_name}__{other_group_name}"
@@ -2315,7 +2449,7 @@ class PPO:
                         context=f"update={self.update_counter}, minibatch={pga_call_index - 1}",
                     )
                 try:
-                    _, right_vectors = torch.linalg.eigh(objective_gram)
+                    _, right_vectors = _stable_symmetric_eigh(objective_gram)
                 except RuntimeError as exc:
                     _raise_numeric_error(
                         "pga_logging_eigendecomposition",
@@ -2675,7 +2809,7 @@ class PPO:
             "actor_pga_sigma_min": mean_actor_pga_sigma_min,
             "actor_pga_sigma_max": mean_actor_pga_sigma_max,
             "actor_pga_sigma_condition_number": mean_actor_pga_sigma_condition_number,
-            "actor_pga_hierarchical_enabled": 1.0 if self.actor_pga_mode == "hierarchical_5" else 0.0,
+            "actor_pga_hierarchical_enabled": 1.0 if self.actor_pga_mode != "flat" else 0.0,
             "actor_scale": mean_actor_scale,
             "actor_amtl_enabled": 1.0 if self.use_actor_amtl else 0.0,
             "critic_amtl_enabled": 1.0 if self.use_critic_amtl else 0.0,
